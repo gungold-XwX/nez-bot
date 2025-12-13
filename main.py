@@ -2,29 +2,36 @@ import os
 import sqlite3
 import random
 import time
-from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import List, Tuple, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, filters
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# ========= ENV =========
+# ================== ENV ==================
 TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# локальное "дневное" расписание через смещение часов (по умолчанию МСК +3)
-TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "3"))  # часы к UTC
+# локальный сдвиг времени (МСК = +3)
+TZ_OFFSET = int(os.environ.get("TZ_OFFSET", "3"))
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
 DB_PATH = "nez.db"
 
-# ========= DB =========
+# ================== DB ==================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -32,561 +39,347 @@ def db():
         user_id INTEGER PRIMARY KEY,
         callsign TEXT,
         points INTEGER DEFAULT 0,
-        created_at INTEGER DEFAULT 0,
-        last_queue_push INTEGER DEFAULT 0
+        created_at INTEGER
     )
     """)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS anomalies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        kind TEXT NOT NULL,              -- "NOCLASS" / "S"
-        payload TEXT NOT NULL,           -- текст расшифровки
-        created_at INTEGER NOT NULL,
+        user_id INTEGER,
+        kind TEXT,
+        payload TEXT,
+        created_at INTEGER,
         fixed_at INTEGER DEFAULT 0,
         decrypted_at INTEGER DEFAULT 0,
-        status TEXT NOT NULL             -- "SENT" / "FIXED" / "DECRYPTED"
+        status TEXT
     )
     """)
     conn.commit()
     return conn
 
 def upsert_user(conn, user_id: int, callsign: str):
-    cur = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    if cur.fetchone() is None:
+    cur = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
+    if not cur.fetchone():
         conn.execute(
-            "INSERT INTO users (user_id, callsign, points, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, callsign[:32], 0, int(time.time()))
+            "INSERT INTO users (user_id, callsign, points, created_at) VALUES (?, ?, 0, ?)",
+            (user_id, callsign[:32], int(time.time()))
         )
-    conn.commit()
+        conn.commit()
 
 def get_user(conn, user_id: int):
-    cur = conn.execute("SELECT user_id, callsign, points, created_at FROM users WHERE user_id=?", (user_id,))
+    cur = conn.execute(
+        "SELECT user_id, callsign, points, created_at FROM users WHERE user_id=?",
+        (user_id,)
+    )
     return cur.fetchone()
 
 def add_points(conn, user_id: int, delta: int):
-    conn.execute("UPDATE users SET points = COALESCE(points,0) + ? WHERE user_id=?", (delta, user_id))
+    conn.execute(
+        "UPDATE users SET points = points + ? WHERE user_id=?",
+        (delta, user_id)
+    )
     conn.commit()
 
-def all_users(conn) -> List[Tuple[int, str, int]]:
+def leaderboard(conn, limit=10):
+    cur = conn.execute(
+        "SELECT callsign, points FROM users ORDER BY points DESC, created_at ASC LIMIT ?",
+        (limit,)
+    )
+    return cur.fetchall()
+
+def all_users(conn):
     cur = conn.execute("SELECT user_id, callsign, points FROM users")
     return cur.fetchall()
 
-def leaderboard(conn, limit=10):
-    cur = conn.execute("SELECT callsign, points FROM users ORDER BY points DESC, created_at ASC LIMIT ?", (limit,))
-    return cur.fetchall()
-
 def queue_position(conn, user_id: int) -> Tuple[int, int]:
-    """
-    Возвращает (позиция, всего).
-    Позиция 1 = лучший (больше points), tie-breaker = раньше зарегистрирован.
-    """
-    cur = conn.execute("""
-        SELECT user_id
-        FROM users
-        ORDER BY points DESC, created_at ASC
-    """)
+    cur = conn.execute(
+        "SELECT user_id FROM users ORDER BY points DESC, created_at ASC"
+    )
     ids = [r[0] for r in cur.fetchall()]
     total = len(ids)
     if user_id not in ids:
-        return (total + 1, total)
-    return (ids.index(user_id) + 1, total)
+        return total + 1, total
+    return ids.index(user_id) + 1, total
 
 def neighbors(conn, user_id: int, window=2):
-    cur = conn.execute("""
-        SELECT user_id, callsign, points
-        FROM users
-        ORDER BY points DESC, created_at ASC
-    """)
+    cur = conn.execute(
+        "SELECT user_id, callsign, points FROM users ORDER BY points DESC, created_at ASC"
+    )
     rows = cur.fetchall()
     ids = [r[0] for r in rows]
     if user_id not in ids:
         return [], []
     idx = ids.index(user_id)
-    above = rows[max(0, idx - window): idx]
-    below = rows[idx + 1: idx + 1 + window]
-    return above, below
+    return rows[max(0, idx-window):idx], rows[idx+1:idx+1+window]
 
-def create_anomaly(conn, user_id: int, kind: str, payload: str) -> int:
-    now = int(time.time())
+# ================== ANOMALIES ==================
+NOCLASS_PAYLOADS = [
+    "Шумовой пакет. Семантика не обнаружена.",
+    "Интерференция среды. Отражение нестабильно.",
+    "След третьего измерения рассеялся.",
+    "Данные фрагментированы. Класс не присвоен."
+]
+
+def s_payload(track_id: int) -> str:
+    return f"[CLASS S]\nARCHIVE FRAGMENT NEZ-S-{track_id:02d}\n…signal continues…"
+
+def create_anomaly(conn, user_id: int, kind: str, payload: str):
     conn.execute("""
-        INSERT INTO anomalies (user_id, kind, payload, created_at, status)
-        VALUES (?, ?, ?, ?, 'SENT')
-    """, (user_id, kind, payload, now))
+    INSERT INTO anomalies (user_id, kind, payload, created_at, status)
+    VALUES (?, ?, ?, ?, 'SENT')
+    """, (user_id, kind, payload, int(time.time())))
     conn.commit()
-    cur = conn.execute("SELECT last_insert_rowid()")
-    return int(cur.fetchone()[0])
 
-def get_active_anomaly(conn, user_id: int) -> Optional[Tuple]:
+def get_active_anomaly(conn, user_id: int):
     cur = conn.execute("""
-        SELECT id, kind, payload, created_at, fixed_at, decrypted_at, status
-        FROM anomalies
-        WHERE user_id=? AND status IN ('SENT','FIXED')
-        ORDER BY created_at DESC
-        LIMIT 1
+    SELECT id, kind, payload, created_at, fixed_at, status
+    FROM anomalies
+    WHERE user_id=? AND status IN ('SENT','FIXED')
+    ORDER BY created_at DESC
+    LIMIT 1
     """, (user_id,))
     return cur.fetchone()
 
-def set_fixed(conn, anomaly_id: int):
+def fix_anomaly(conn, anomaly_id: int):
     conn.execute("""
-        UPDATE anomalies SET fixed_at=?, status='FIXED'
-        WHERE id=? AND status='SENT'
+    UPDATE anomalies SET fixed_at=?, status='FIXED'
+    WHERE id=? AND status='SENT'
     """, (int(time.time()), anomaly_id))
     conn.commit()
 
-def set_decrypted(conn, anomaly_id: int):
+def decrypt_anomaly(conn, anomaly_id: int):
     conn.execute("""
-        UPDATE anomalies SET decrypted_at=?, status='DECRYPTED'
-        WHERE id=? AND status='FIXED'
+    UPDATE anomalies SET decrypted_at=?, status='DECRYPTED'
+    WHERE id=? AND status='FIXED'
     """, (int(time.time()), anomaly_id))
     conn.commit()
 
-# ========= LORE / CONTENT =========
+# ================== UI ==================
 def hdr():
-    return "NEZ PROJECT × GOV // EDEN QUEUE TERMINAL\n"
+    return "NEZ PROJECT × GOV // EDEN QUEUE\n"
 
-def s_payload_stub(track_id: int) -> str:
-    # сюда позже вставим реальные отрывки/ID треков
-    return f"[CLASS S] ARCHIVE SIGNAL\nFRAG: NEZ-S-{track_id:02d}\nCONTENT: (sanitized excerpt)\n…"
-
-NOCLASS_PAYLOADS = [
-    "Данные шумовые. Семантика не выделена. [NOCLASS]",
-    "Интерференция среды. Резонанс ложный. [NOCLASS]",
-    "Слой третьего измерения проявился кратковременно. Трассировка невозможна. [NOCLASS]",
-    "Пакет данных неполный. Маркер «отражение» не подтверждён. [NOCLASS]",
-]
-
-# ========= UI =========
-def main_menu():
+def menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Справка (очередь)", callback_data="Q")],
-        [InlineKeyboardButton("⚠️ Проверить аномалию", callback_data="A")],
+        [InlineKeyboardButton("📄 Очередь", callback_data="Q")],
+        [InlineKeyboardButton("⚠️ Аномалия", callback_data="A")],
         [InlineKeyboardButton("🏆 Топ", callback_data="TOP")],
-        [InlineKeyboardButton("ℹ️ Как это работает", callback_data="HELP")],
+        [InlineKeyboardButton("ℹ️ Справка", callback_data="HELP")],
     ])
 
-def anomaly_fix_kb(anomaly_id: int):
+def fix_kb(aid: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📌 Зафиксировать", callback_data=f"FIX:{anomaly_id}")]
+        [InlineKeyboardButton("📌 Зафиксировать", callback_data=f"FIX:{aid}")]
     ])
 
-def anomaly_decrypt_kb(anomaly_id: int):
+def decrypt_kb(aid: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 Расшифровать", callback_data=f"DEC:{anomaly_id}")]
+        [InlineKeyboardButton("🔎 Расшифровать", callback_data=f"DEC:{aid}")]
     ])
 
-# ========= CORE LOGIC =========
-def now_utc() -> int:
+# ================== TIME ==================
+def now():
     return int(time.time())
 
-def local_hour(utc_ts: int) -> int:
-    # "локальные" часы по TZ_OFFSET
-    return int((utc_ts + TZ_OFFSET * 3600) % 86400) // 3600
+def local_hour(ts: int):
+    return ((ts + TZ_OFFSET*3600) % 86400) // 3600
 
-def daytime_six_hour_slots() -> List[int]:
-    """
-    6-часовые слоты ДНЁМ.
-    Выберем 10:00, 16:00, 22:00 (локально) — 3 справки.
-    Если хочешь строго "днём" без 22:00 — скажи, сделаю 9/15/21 или 10/16/20.
-    """
-    return [10, 16, 22]
-
-def is_daytime_for_queue(utc_ts: int) -> bool:
-    h = local_hour(utc_ts)
-    return h in daytime_six_hour_slots()
-
-def chance_class_s(pos: int, total: int) -> float:
-    # чем ближе к 1 месту, тем выше шанс S
-    if total <= 1:
-        return 0.6
-    # нормируем: топ-1 ~0.65, середина ~0.20, низ ~0.08
-    x = (total - pos) / (total - 1)  # 0..1
-    return 0.08 + x * 0.57
-
-# ========= HANDLERS =========
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== COMMANDS ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = db()
-    user_id = update.effective_user.id
-    name = (update.effective_user.username or update.effective_user.first_name or "observer")
-    upsert_user(conn, user_id, name)
-
-    u = get_user(conn, user_id)
-    pos, total = queue_position(conn, user_id)
+    uid = update.effective_user.id
+    name = update.effective_user.username or update.effective_user.first_name or "observer"
+    upsert_user(conn, uid, name)
+    pos, total = queue_position(conn, uid)
 
     text = (
-        hdr()
-        + f"Добро пожаловать в цифровую очередь Нулевого Эдема.\n"
-        + f"Путешественник: {u[1]}\n"
-        + f"Текущая позиция: {pos}/{total}\n\n"
-        + "Система присылает справку о позиции каждые 6 часов днём.\n"
-        + "3 раза в день появляются аномалии: нужно быстро фиксировать и расшифровывать.\n\n"
-        + "Открой меню:"
+        hdr() +
+        f"Путешественник: {name}\n"
+        f"Позиция в очереди: {pos}/{total}\n\n"
+        "Это цифровая очередь в Нулевой Эдем.\n"
+        "Следи за аномалиями и продвигайся вверх."
     )
-    await update.message.reply_text(text, reply_markup=main_menu())
+    await update.message.reply_text(text, reply_markup=menu())
 
-async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_queue_card(update, context)
-
-async def send_queue_card(update: Update, context: ContextTypes.DEFAULT_TYPE, as_message: bool=True):
+async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     conn = db()
-    user_id = update.effective_user.id
-    u = get_user(conn, user_id)
-    if not u:
-        if as_message:
-            await update.message.reply_text("Нажми /start", reply_markup=main_menu())
-        else:
-            await update.callback_query.edit_message_text("Нажми /start", reply_markup=main_menu())
-        return
+    uid = update.effective_user.id
+    u = get_user(conn, uid)
+    pos, total = queue_position(conn, uid)
+    up, down = neighbors(conn, uid)
 
-    pos, total = queue_position(conn, user_id)
-    above, below = neighbors(conn, user_id, window=2)
+    text = hdr() + f"Очередь: {pos}/{total}\nОчки: {u[2]}\n\n"
+    if up:
+        text += "↑ Выше:\n" + "\n".join([f"{r[1]} ({r[2]})" for r in up]) + "\n"
+    if down:
+        text += "↓ Ниже:\n" + "\n".join([f"{r[1]} ({r[2]})" for r in down])
 
-    def fmt_row(r):
-        _uid, cs, pts = r
-        return f"{cs} — {pts} pts"
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=menu())
+    else:
+        await update.message.reply_text(text, reply_markup=menu())
 
-    neighbors_text = ""
-    if above:
-        neighbors_text += "Соседи выше:\n" + "\n".join(["↑ " + fmt_row(r) for r in above]) + "\n"
-    if below:
-        neighbors_text += "Соседи ниже:\n" + "\n".join(["↓ " + fmt_row(r) for r in below]) + "\n"
-    if not neighbors_text:
-        neighbors_text = "Соседи: недостаточно данных.\n"
+async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+    conn = db()
+    rows = leaderboard(conn)
+    text = hdr() + "🏆 ТОП\n\n"
+    for i, (cs, pts) in enumerate(rows, 1):
+        text += f"{i}. {cs} — {pts}\n"
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=menu())
+    else:
+        await update.message.reply_text(text, reply_markup=menu())
 
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     text = (
-        hdr()
-        + "СПРАВКА О ПОЗИЦИИ\n"
-        + f"Путешественник: {u[1]}\n"
-        + f"Позиция в очереди: {pos}/{total}\n"
-        + f"Очки (репутация): {u[2]}\n\n"
-        + neighbors_text
-        + "\nПодсказка: ловля аномалий ускоряет рост очереди."
+        hdr() +
+        "• Очередь обновляется автоматически\n"
+        "• Аномалии появляются 3 раза в день\n"
+        "• Быстрая фиксация = больше очков\n"
+        "• CLASS S — фрагменты архива\n\n"
+        "Игроки с верхних позиций будут отмечены на концерте."
     )
-
-    if as_message:
-        await update.message.reply_text(text, reply_markup=main_menu())
+    if edit:
+        await update.callback_query.edit_message_text(text, reply_markup=menu())
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu())
+        await update.message.reply_text(text, reply_markup=menu())
 
-async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE, as_message=True):
-    text = (
-        hdr()
-        + "КАК ЭТО РАБОТАЕТ\n\n"
-        + "• Очередь: чем выше — тем ближе к «окну».\n"
-        + "• Аномалии: 3 раза в день появляются данные.\n"
-        + "  1) нажми «Зафиксировать» как можно быстрее\n"
-        + "  2) подожди 10 минут\n"
-        + "  3) нажми «Расшифровать»\n\n"
-        + "• Класс S (редко): это сигналы архива (фрагменты альбома).\n"
-        + "  Чем выше позиция — тем выше шанс получить S.\n\n"
-        + "Награды:\n"
-        + "• фиксация: +2 pts\n"
-        + "• расшифровка: +3 pts (S даёт +5)\n"
-        + "\nМеню ниже."
-    )
-    if as_message:
-        await update.message.reply_text(text, reply_markup=main_menu())
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu())
-
-async def send_top(update: Update, context: ContextTypes.DEFAULT_TYPE, as_message=True):
+async def check_anomaly(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
     conn = db()
-    rows = leaderboard(conn, limit=10)
-    if not rows:
-        text = hdr() + "Топ пуст. Нужны путешественники."
-    else:
-        lines = [hdr() + "🏆 ТОП ПУТЕШЕСТВЕННИКОВ\n"]
-        for i, (cs, pts) in enumerate(rows, start=1):
-            lines.append(f"{i:02d}. {cs} — {pts} pts")
-        text = "\n".join(lines)
-
-    if as_message:
-        await update.message.reply_text(text, reply_markup=main_menu())
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu())
-
-async def send_or_check_anomaly(update: Update, context: ContextTypes.DEFAULT_TYPE, as_message=True):
-    conn = db()
-    user_id = update.effective_user.id
-    u = get_user(conn, user_id)
-    if not u:
-        if as_message:
-            await update.message.reply_text("Нажми /start", reply_markup=main_menu())
-        else:
-            await update.callback_query.edit_message_text("Нажми /start", reply_markup=main_menu())
-        return
-
-    a = get_active_anomaly(conn, user_id)
+    uid = update.effective_user.id
+    a = get_active_anomaly(conn, uid)
     if not a:
-        text = hdr() + "Аномалий нет.\nОжидайте следующего окна (3 раза в день)."
-        if as_message:
-            await update.message.reply_text(text, reply_markup=main_menu())
+        text = hdr() + "Аномалий нет. Ожидайте следующего окна."
+        if edit:
+            await update.callback_query.edit_message_text(text, reply_markup=menu())
         else:
-            await update.callback_query.edit_message_text(text, reply_markup=main_menu())
+            await update.message.reply_text(text, reply_markup=menu())
         return
 
-    anomaly_id, kind, payload, created_at, fixed_at, decrypted_at, status = a
-    age_min = max(0, (now_utc() - created_at) // 60)
-
+    aid, kind, payload, created, fixed_at, status = a
     if status == "SENT":
-        text = (
-            hdr()
-            + "⚠️ ОБНАРУЖЕНА АНОМАЛИЯ\n"
-            + f"Время обнаружения: {age_min} мин назад\n"
-            + "Действие: требуется фиксация.\n"
-        )
-        kb = anomaly_fix_kb(anomaly_id)
+        text = hdr() + "⚠️ Обнаружена аномалия.\nТребуется фиксация."
+        kb = fix_kb(aid)
     else:
-        # FIXED
-        waited = now_utc() - int(fixed_at or 0)
-        remaining = max(0, 600 - waited)  # 10 минут
-        if remaining > 0:
-            text = (
-                hdr()
-                + "АНОМАЛИЯ ЗАФИКСИРОВАНА\n"
-                + f"Ожидание перед расшифровкой: ещё {remaining//60} мин {remaining%60} сек\n"
-                + "Протокол: выдержать интервал, затем расшифровать."
-            )
-            kb = main_menu()
+        wait = now() - fixed_at
+        if wait < 600:
+            text = hdr() + f"Фиксация принята.\nОжидайте {600-wait} сек."
+            kb = menu()
         else:
-            text = (
-                hdr()
-                + "АНОМАЛИЯ ГОТОВА К РАСШИФРОВКЕ\n"
-                + "Действие: расшифровать пакет данных."
-            )
-            kb = anomaly_decrypt_kb(anomaly_id)
+            text = hdr() + "Аномалия готова к расшифровке."
+            kb = decrypt_kb(aid)
 
-    if as_message:
-        await update.message.reply_text(text, reply_markup=kb)
-    else:
+    if edit:
         await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
 
-# ========= CALLBACKS =========
-async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================== CALLBACKS ==================
+async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data
-
-    if data == "Q":
-        await send_queue_card(update, context, as_message=False)
-    elif data == "A":
-        await send_or_check_anomaly(update, context, as_message=False)
-    elif data == "TOP":
-        await send_top(update, context, as_message=False)
-    elif data == "HELP":
-        await send_help(update, context, as_message=False)
+    d = q.data
+    if d == "Q":
+        await show_queue(update, context, edit=True)
+    elif d == "A":
+        await check_anomaly(update, context, edit=True)
+    elif d == "TOP":
+        await show_top(update, context, edit=True)
+    elif d == "HELP":
+        await show_help(update, context, edit=True)
 
 async def on_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    aid = int(q.data.split(":")[1])
     conn = db()
-    user_id = update.effective_user.id
-
-    parts = q.data.split(":")
-    anomaly_id = int(parts[1])
-
-    # фиксируем
-    set_fixed(conn, anomaly_id)
-    add_points(conn, user_id, 2)
-
-    text = (
-        hdr()
-        + "📌 ФИКСАЦИЯ ПРИНЯТА\n"
-        + "Протокол: выдержать интервал 10 минут.\n"
-        + "Затем появится расшифровка.\n\n"
-        + "Подсказка: кнопку «Проверить аномалию» можно нажать позже."
-        + "\nНаграда: +2 pts"
+    fix_anomaly(conn, aid)
+    add_points(conn, update.effective_user.id, 2)
+    await q.edit_message_text(
+        hdr() + "Фиксация принята. Ожидайте 10 минут.",
+        reply_markup=menu()
     )
-    await q.edit_message_text(text, reply_markup=main_menu())
 
 async def on_decrypt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    aid = int(q.data.split(":")[1])
     conn = db()
-    user_id = update.effective_user.id
-
-    anomaly_id = int(q.data.split(":")[1])
-
-    # проверяем таймер 10 минут
-    cur = conn.execute("SELECT fixed_at, kind, payload, status FROM anomalies WHERE id=? AND user_id=?", (anomaly_id, user_id))
-    row = cur.fetchone()
-    if not row:
-        await q.edit_message_text(hdr() + "Аномалия не найдена.", reply_markup=main_menu())
-        return
-
-    fixed_at, kind, payload, status = row
-    if status != "FIXED":
-        await q.edit_message_text(hdr() + "Расшифровка недоступна.", reply_markup=main_menu())
-        return
-
-    waited = now_utc() - int(fixed_at or 0)
-    if waited < 600:
-        remaining = 600 - waited
-        await q.edit_message_text(
-            hdr() + f"Слишком рано.\nОжидайте ещё {remaining//60} мин {remaining%60} сек.",
-            reply_markup=main_menu()
-        )
-        return
-
-    # расшифровка
-    set_decrypted(conn, anomaly_id)
-
-    # награда
-    reward = 5 if kind == "S" else 3
-    add_points(conn, user_id, reward)
-
-    text = (
-        hdr()
-        + "🔎 РАСШИФРОВКА\n"
-        + f"Класс: {kind}\n\n"
-        + payload
-        + f"\n\nНаграда: +{reward} pts"
+    cur = conn.execute(
+        "SELECT kind, payload FROM anomalies WHERE id=?",
+        (aid,)
     )
-    await q.edit_message_text(text, reply_markup=main_menu())
+    kind, payload = cur.fetchone()
+    decrypt_anomaly(conn, aid)
+    reward = 5 if kind == "S" else 3
+    add_points(conn, update.effective_user.id, reward)
+    await q.edit_message_text(
+        hdr() + f"🔎 Расшифровка\n\n{payload}\n\n+{reward} pts",
+        reply_markup=menu()
+    )
 
-# ========= SCHEDULER JOBS =========
-async def job_push_queue(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Каждые 6 часов ДНЁМ — рассылка справки о позиции.
-    Мы запускаем job каждый час, но отправляем только в нужные локальные часы.
-    """
-    utc_ts = now_utc()
-    if not is_daytime_for_queue(utc_ts):
+# ================== JOBS ==================
+async def job_queue_push(context: ContextTypes.DEFAULT_TYPE):
+    h = local_hour(now())
+    if h not in (10, 16, 22):
         return
-
     conn = db()
-    users = all_users(conn)
-    for user_id, callsign, pts in users:
-        pos, total = queue_position(conn, user_id)
-        text = (
-            hdr()
-            + "СПРАВКА (AUTO)\n"
-            + f"Позиция: {pos}/{total}\n"
-            + f"Очки: {pts}\n"
-            + "Доступ контролируется NEZ Project.\n"
-        )
+    for uid, cs, pts in all_users(conn):
+        pos, total = queue_position(conn, uid)
         try:
-            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=main_menu())
-        except Exception:
-            # если юзер заблокировал бота — просто пропускаем
+            await context.bot.send_message(
+                uid,
+                hdr() + f"Справка\nПозиция: {pos}/{total}\nОчки: {pts}",
+                reply_markup=menu()
+            )
+        except:
             pass
 
 async def job_spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Запускать 3 раза в сутки в случайные часы (днём).
-    Эта job рассылает аномалию всем пользователям.
-    """
     conn = db()
     users = all_users(conn)
-    if not users:
-        return
-
-    # для каждого пользователя решаем класс по позиции
-    for user_id, callsign, pts in users:
-        pos, total = queue_position(conn, user_id)
-        pS = chance_class_s(pos, total)
-        is_s = random.random() < pS
-
-        if is_s:
-            track_id = random.randint(1, 12)
-            payload = s_payload_stub(track_id)
+    for uid, cs, pts in users:
+        pos, total = queue_position(conn, uid)
+        chance = 0.1 + (1 - pos/max(1,total)) * 0.6
+        if random.random() < chance:
+            payload = s_payload(random.randint(1, 12))
             kind = "S"
         else:
             payload = random.choice(NOCLASS_PAYLOADS)
             kind = "NOCLASS"
-
-        anomaly_id = create_anomaly(conn, user_id, kind, payload)
-
-        text = (
-            hdr()
-            + "⚠️ ОБНАРУЖЕНА АНОМАЛИЯ\n"
-            + "Действие: требуется срочная фиксация.\n"
-            + "Чем быстрее фиксация — тем выше приоритет в очереди."
-        )
+        create_anomaly(conn, uid, kind, payload)
         try:
             await context.bot.send_message(
-                chat_id=user_id,
-                text=text,
-                reply_markup=anomaly_fix_kb(anomaly_id)
+                uid,
+                hdr() + "⚠️ Обнаружена аномалия",
+                reply_markup=menu()
             )
-        except Exception:
+        except:
             pass
 
-def seconds_until_local_hour(target_hour: int) -> int:
-    """
-    Через сколько секунд наступит ближайший target_hour (локально, по TZ_OFFSET).
-    """
-    utc = now_utc()
-    local = utc + TZ_OFFSET * 3600
-    lt = time.gmtime(local)  # используем UTC как "локальный" после сдвига
-    current_sec = lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
-    target_sec = target_hour * 3600
-    if target_sec <= current_sec:
-        # завтра
-        return (24 * 3600 - current_sec) + target_sec
-    return target_sec - current_sec
-
-def random_day_anomaly_hours() -> List[int]:
-    # 3 раза в день, рандомно, "днём": 11..22
-    hours = random.sample(range(11, 23), 3)
-    hours.sort()
-    return hours
-
-async def schedule_daily_anomalies(app: Application):
-    """
-    Планируем 3 аномалии на ближайшие 24 часа.
-    """
-    hours = random_day_anomaly_hours()
-    for h in hours:
-        delay = seconds_until_local_hour(h)
-        app.job_queue.run_once(job_spawn_anomalies, when=delay, name=f"anomaly@{h:02d}")
-
-# ========= APP =========
-def build_app() -> Application:
+# ================== APP ==================
+def build_app():
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("queue", cmd_queue))
-
-    app.add_handler(CallbackQueryHandler(on_fix, pattern=r"^FIX:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_decrypt, pattern=r"^DEC:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_menu_click, pattern=r"^(Q|A|TOP|HELP)$"))
-
-    # Если человек пишет текст — просто показываем меню (чтобы не терялся)
-    async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(hdr() + "Открой меню:", reply_markup=main_menu())
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_fix, pattern=r"^FIX:"))
+    app.add_handler(CallbackQueryHandler(on_decrypt, pattern=r"^DEC:"))
+    app.add_handler(CallbackQueryHandler(on_click))
+    app.add_handler(MessageHandler(filters.TEXT, lambda u, c: u.message.reply_text("Открой меню", reply_markup=menu())))
 
     return app
 
 if __name__ == "__main__":
     application = build_app()
 
-    # 1) очередь: проверяем каждый час, но отправляем только в 10/16/22 локально
-    application.job_queue.run_repeating(job_push_queue, interval=3600, first=30)
+    application.job_queue.run_repeating(job_queue_push, interval=3600, first=60)
+    application.job_queue.run_repeating(job_spawn_anomalies, interval=8*3600, first=120)
 
-    # 2) аномалии: планируем 3 окна на сутки, и перепланируем раз в 24ч
-    #    (первое расписание сразу при старте)
-    async def bootstrap_jobs(app: Application):
-        await schedule_daily_anomalies(app)
-
-        async def reschedule(context: ContextTypes.DEFAULT_TYPE):
-            await schedule_daily_anomalies(application)
-
-        # перепланирование каждые 24 часа
-        application.job_queue.run_repeating(lambda ctx: application.create_task(reschedule(ctx)),
-                                            interval=24*3600, first=24*3600)
-
-    application.create_task(bootstrap_jobs(application))
-
-    # запуск webhook/polling
     if BASE_URL:
-        webhook_url = f"{BASE_URL.rstrip('/')}/telegram"
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path="telegram",
-            webhook_url=webhook_url,
+            webhook_url=f"{BASE_URL}/telegram",
             drop_pending_updates=True
         )
     else:
