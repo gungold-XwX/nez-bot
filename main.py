@@ -12,7 +12,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
-    filters
+    filters,
 )
 
 # ================== ENV ==================
@@ -27,12 +27,17 @@ if not TOKEN:
 DB_PATH = "nez.db"
 
 # ================== STYLE ==================
+LINE = "━━━━━━━━━━━━━━━━━━"
+
 def hdr():
     return (
         "🔴 NEZ PROJECT × GOV\n"
-        "▶ DIGITAL ACCESS QUEUE / EDEN-0\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "▶ EDEN-0 ACCESS QUEUE TERMINAL\n"
+        f"{LINE}\n"
     )
+
+def footer_hint():
+    return "\n▶ Используйте меню ниже."
 
 # ================== DB ==================
 def db():
@@ -67,27 +72,28 @@ def db():
 # ================== USERS ==================
 def get_user(conn, uid):
     return conn.execute(
-        "SELECT user_id, username, points FROM users WHERE user_id=?",
+        "SELECT user_id, username, points, created_at FROM users WHERE user_id=?",
         (uid,)
     ).fetchone()
 
 def create_user(conn, uid, name):
     conn.execute(
-        "INSERT INTO users VALUES (?, ?, 0, ?)",
+        "INSERT INTO users (user_id, username, points, created_at) VALUES (?, ?, 0, ?)",
         (uid, name, int(time.time()))
     )
     conn.commit()
 
 def add_points(conn, uid, pts):
-    conn.execute(
-        "UPDATE users SET points = points + ? WHERE user_id=?",
-        (pts, uid)
-    )
+    conn.execute("UPDATE users SET points = points + ? WHERE user_id=?", (pts, uid))
     conn.commit()
 
 def all_users(conn):
+    return conn.execute("SELECT user_id, username, points FROM users").fetchall()
+
+def leaderboard(conn, limit=10):
     return conn.execute(
-        "SELECT user_id, username, points FROM users"
+        "SELECT username, points FROM users ORDER BY points DESC, created_at ASC LIMIT ?",
+        (limit,)
     ).fetchall()
 
 def queue_position(conn, uid) -> Tuple[int, int]:
@@ -102,13 +108,10 @@ USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,20}$")
 
 # ================== S AUDIO ==================
 def add_s_audio(conn, title, fid):
-    conn.execute(
-        "INSERT INTO s_audio (title, file_id) VALUES (?, ?)",
-        (title[:60], fid)
-    )
+    conn.execute("INSERT INTO s_audio (title, file_id) VALUES (?, ?)", (title[:60], fid))
     conn.commit()
 
-def random_s_audio(conn):
+def random_s_audio(conn) -> Optional[Tuple[str, str]]:
     return conn.execute(
         "SELECT title, file_id FROM s_audio ORDER BY RANDOM() LIMIT 1"
     ).fetchone()
@@ -116,9 +119,10 @@ def random_s_audio(conn):
 # ================== ANOMALIES ==================
 NOCLASS = [
     "▒▒▒ СОДЕРЖИМОЕ УТЕРЯНО ▒▒▒",
-    "РАСШИФРОВКА ПРЕРВАНА",
-    "ДАННЫЕ ПОВРЕЖДЕНЫ",
-    "▒░▒▒░▒░▒▒░▒░▒▒▒░▒░",
+    "РАСШИФРОВКА ПРЕРВАНА ░ ДАННЫЕ НЕВОССТАНОВИМЫ",
+    "ДАННЫЕ ПОВРЕЖДЕНЫ. КЛАСС НЕ ПРИСВОЕН.",
+    "⛧ ░▒▒░ ▒░░░ ░▒ ▒▒░░ ⛧",
+    "▒░▒▒░░▒▒▒░▒░░▒▒░▒░▒░░▒▒▒░░▒▒░",
 ]
 
 def create_anomaly(conn, uid, kind, payload):
@@ -130,7 +134,7 @@ def create_anomaly(conn, uid, kind, payload):
 
 def get_active_anomaly(conn, uid):
     return conn.execute("""
-    SELECT id, kind, payload, fixed_at, status
+    SELECT id, kind, payload, created_at, fixed_at, status
     FROM anomalies
     WHERE user_id=? AND status IN ('SENT','FIXED')
     ORDER BY created_at DESC LIMIT 1
@@ -139,29 +143,24 @@ def get_active_anomaly(conn, uid):
 # ================== BULLETIN ==================
 def build_bulletin(conn):
     today = time.strftime("%d.%m.%Y")
-    rows = conn.execute(
-        "SELECT username, points FROM users ORDER BY points DESC LIMIT 10"
-    ).fetchall()
+    rows = leaderboard(conn, limit=10)
 
     text = (
         "🔴 NEZ PROJECT × GOV\n"
         "▶ OFFICIAL BULLETIN / EDEN-0\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        f"{LINE}\n"
         f"ДАТА: {today}\n\n"
         "СОСТОЯНИЕ СИСТЕМЫ:\n"
         "— активность третьего измерения повышена\n"
-        "— очередь нестабильна\n"
-        "— зафиксированы новые аномалии\n\n"
-        "РЕЙТИНГ ДОСТУПА:\n"
+        "— очередь динамична (перерасчёт допуска)\n"
+        "— зафиксированы новые пакеты данных\n\n"
+        "ТОП ДОПУСКА:\n"
     )
-
     for i, (name, pts) in enumerate(rows, 1):
-        if i <= 3:
-            text += f"{i:02d}. {name} — {pts} pts  [CANDIDATE]\n"
-        else:
-            text += f"{i:02d}. {name} — {pts} pts\n"
+        tag = "  [CANDIDATE]" if i <= 3 else ""
+        text += f"{i:02d}. {name} — {pts} IDx{tag}\n"
 
-    text += "\n▶ Следующий бюллетень через 24 часа"
+    text += "\n▶ Примечание: кандидаты TOP-3 будут отмечены на спец. мероприятии."
     return text
 
 async def send_daily_bulletin(context: ContextTypes.DEFAULT_TYPE):
@@ -174,29 +173,56 @@ async def send_daily_bulletin(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 # ================== UI ==================
-def menu(uid):
+def menu(uid: int):
     rows = [
-        [InlineKeyboardButton("▶ СТАТУС ОЧЕРЕДИ", callback_data="Q")],
-        [InlineKeyboardButton("🔴 АКТИВНАЯ АНОМАЛИЯ", callback_data="A")],
+        [InlineKeyboardButton("🔵 СТАТУС ОЧЕРЕДИ", callback_data="Q")],
+        [InlineKeyboardButton("🔴 АКТИВНЫЙ ПАКЕТ", callback_data="A")],
         [InlineKeyboardButton("🏛 РЕЙТИНГ", callback_data="TOP")],
+        [InlineKeyboardButton("ℹ️ ПОМОЩЬ / ПРОТОКОЛ", callback_data="HELP")],
     ]
     if uid == ADMIN_ID:
-        rows.append([InlineKeyboardButton("🔴 ЗАПУСТИТЬ АНОМАЛИЮ", callback_data="ADMIN_ANOM")])
-        rows.append([InlineKeyboardButton("➕ ДОБАВИТЬ S-СИГНАЛ", callback_data="ADD_S")])
+        rows.append([InlineKeyboardButton("🔴 (ADMIN) ЗАПУСТИТЬ ПАКЕТ", callback_data="ADMIN_ANOM")])
+        rows.append([InlineKeyboardButton("➕ (ADMIN) ДОБАВИТЬ S-СИГНАЛ", callback_data="ADD_S")])
     return InlineKeyboardMarkup(rows)
 
-def fix_kb(aid):
+def confirm_kb(aid: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶ ЗАФИКСИРОВАТЬ", callback_data=f"FIX:{aid}")]
+        [InlineKeyboardButton("✅ ПОДТВЕРДИТЬ ПОЛУЧЕНИЕ", callback_data=f"ACK:{aid}")]
     ])
 
-def decrypt_kb(aid):
+def decrypt_kb(aid: int):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("▶ РАСШИФРОВАТЬ", callback_data=f"DEC:{aid}")]
+        [InlineKeyboardButton("🔎 РАСШИФРОВАТЬ ПАКЕТ", callback_data=f"DEC:{aid}")]
     ])
 
 WAITING_USERNAME = set()
 WAITING_AUDIO = set()
+
+# ================== HELP TEXT ==================
+def help_text():
+    return (
+        hdr() +
+        "ℹ️ ПРОТОКОЛ УЧАСТИЯ\n"
+        f"{LINE}\n\n"
+        "Что это:\n"
+        "— цифровая очередь доступа к объекту EDEN-0\n"
+        "— система ведёт ранжирование наблюдателей\n\n"
+        "Почему вы продвигаетесь:\n"
+        "— NEZ не выдаёт доступ всем сразу\n"
+        "— очередь пересчитывается по Индексу допуска (IDx)\n"
+        "— IDx растёт, когда вы быстро и корректно подтверждаете пакеты и проходите расшифровку\n\n"
+        "Как действовать:\n"
+        "1) появляется 🔴 АКТИВНЫЙ ПАКЕТ\n"
+        "2) нажмите ✅ ПОДТВЕРДИТЬ ПОЛУЧЕНИЕ (это регистрация реакции наблюдателя)\n"
+        "3) выдержите интервал ⏳ 10 минут\n"
+        "4) нажмите 🔎 РАСШИФРОВАТЬ ПАКЕТ\n\n"
+        "Классы:\n"
+        "— NOCLASS: шум/обрывки\n"
+        "— CLASS S: архивный сигнал (аудио). Чем выше очередь — тем выше шанс.\n\n"
+        "Важно:\n"
+        "— TOP позиции будут публично отмечены\n"
+        "— поздравление проводит глава NEZ на спец. мероприятии\n"
+    )
 
 # ================== START ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,9 +234,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pos, total = queue_position(conn, uid)
         await update.message.reply_text(
             hdr() +
-            f"🟢 ДОСТУП АКТИВЕН\n\n"
+            "🟢 ДОСТУП АКТИВЕН\n\n"
             f"ID: {u[1]}\n"
-            f"Позиция: {pos} / {total}",
+            f"Позиция: {pos} / {total}\n"
+            f"Индекс допуска (IDx): {u[2]}\n"
+            + footer_hint(),
             reply_markup=menu(uid)
         )
         return
@@ -218,16 +246,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WAITING_USERNAME.add(uid)
     await update.message.reply_text(
         hdr() +
-        "▶ РЕГИСТРАЦИЯ ДОСТУПА\n\n"
+        "▶ РЕГИСТРАЦИЯ ДОСТУПА\n"
+        f"{LINE}\n\n"
         "Первые позиции очереди будут публично отмечены.\n"
         "Поздравление проводит глава NEZ на специальном мероприятии.\n\n"
-        "▶ Требования к ID:\n"
-        "латиница / цифры / . _ -\n"
-        "длина: 3–20\n\n"
-        "Введите идентификатор:"
+        "Требования к ID:\n"
+        "— латиница / цифры / . _ -\n"
+        "— длина 3–20\n"
+        "— ID не изменяется после регистрации\n\n"
+        "Введите ID (пример: metaego_01):"
     )
 
-# ================== TEXT ==================
+# ================== TEXT INPUT ==================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in WAITING_USERNAME:
@@ -236,20 +266,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not USERNAME_RE.match(name):
         await update.message.reply_text(
-            hdr() + "⛔ НЕКОРРЕКТНЫЙ ИДЕНТИФИКАТОР\nПопробуйте снова."
+            hdr() +
+            "⛔ ОТКАЗ В РЕГИСТРАЦИИ\n"
+            f"{LINE}\n"
+            "ID не соответствует формату.\n"
+            "Разрешено: a-z A-Z 0-9 _ . -\n"
+            "Длина: 3–20\n\n"
+            "Введите ID снова:"
         )
         return
 
     conn = db()
+    # защита от повторов (чтобы не было одинаковых ников)
+    exists = conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone()
+    if exists:
+        await update.message.reply_text(
+            hdr() +
+            "⛔ ОТКАЗ В РЕГИСТРАЦИИ\n"
+            f"{LINE}\n"
+            "ID уже занят.\n"
+            "Введите другой:"
+        )
+        return
+
     create_user(conn, uid, name)
     WAITING_USERNAME.remove(uid)
 
     pos, total = queue_position(conn, uid)
     await update.message.reply_text(
         hdr() +
-        "🟢 РЕГИСТРАЦИЯ ЗАВЕРШЕНА\n\n"
+        "🟢 РЕГИСТРАЦИЯ ПРИНЯТА\n"
+        f"{LINE}\n\n"
         f"ID: {name}\n"
-        f"Позиция: {pos} / {total}",
+        f"Позиция: {pos} / {total}\n"
+        "Индекс допуска (IDx): 0\n\n"
+        "▶ Рекомендуется открыть ℹ️ ПОМОЩЬ / ПРОТОКОЛ.",
         reply_markup=menu(uid)
     )
 
@@ -260,63 +311,211 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     conn = db()
 
+    if q.data == "HELP":
+        await q.edit_message_text(help_text(), reply_markup=menu(uid))
+        return
+
     if q.data == "Q":
+        u = get_user(conn, uid)
+        if not u:
+            await q.edit_message_text(hdr() + "⛔ Требуется регистрация. Нажмите /start")
+            return
         pos, total = queue_position(conn, uid)
         await q.edit_message_text(
-            hdr() + f"🔵 СТАТУС ОЧЕРЕДИ\n\nПозиция: {pos} / {total}",
+            hdr() +
+            "🔵 СТАТУС ОЧЕРЕДИ\n"
+            f"{LINE}\n\n"
+            f"ID: {u[1]}\n"
+            f"Позиция: {pos} / {total}\n"
+            f"Индекс допуска (IDx): {u[2]}\n\n"
+            "▶ Чем выше IDx — тем выше шанс CLASS S.\n"
+            + footer_hint(),
             reply_markup=menu(uid)
         )
+        return
 
-    elif q.data == "A":
+    if q.data == "TOP":
+        rows = leaderboard(conn, limit=10)
+        txt = hdr() + "🏛 РЕЙТИНГ ДОПУСКА\n" + f"{LINE}\n\n"
+        for i, (n, p) in enumerate(rows, 1):
+            mark = "  🟥CANDIDATE" if i <= 3 else ""
+            txt += f"{i:02d}. {n} — {p} IDx{mark}\n"
+        txt += "\n▶ TOP-3 отмечаются публично."
+        await q.edit_message_text(txt, reply_markup=menu(uid))
+        return
+
+    if q.data == "A":
         a = get_active_anomaly(conn, uid)
         if not a:
             await q.edit_message_text(
-                hdr() + "🟢 АКТИВНЫХ АНОМАЛИЙ НЕТ",
+                hdr() +
+                "🟢 АКТИВНЫХ ПАКЕТОВ НЕТ\n"
+                f"{LINE}\n"
+                "Ожидайте следующее окно.",
                 reply_markup=menu(uid)
             )
             return
-        aid, kind, payload, fixed_at, status = a
+
+        aid, kind, payload, created_at, fixed_at, status = a
         if status == "SENT":
             await q.edit_message_text(
-                hdr() + "🔴 АНОМАЛИЯ ОБНАРУЖЕНА\n▶ Требуется фиксация",
-                reply_markup=fix_kb(aid)
+                hdr() +
+                "🔴 АКТИВНЫЙ ПАКЕТ ОБНАРУЖЕН\n"
+                f"{LINE}\n\n"
+                "▶ Действие: подтвердите получение.\n"
+                "Это фиксирует вашу реакцию как наблюдателя.",
+                reply_markup=confirm_kb(aid)
+            )
+            return
+
+        # FIXED
+        waited = int(time.time()) - int(fixed_at or 0)
+        remaining = max(0, 600 - waited)
+        if remaining > 0:
+            await q.edit_message_text(
+                hdr() +
+                "🟠 ПОЛУЧЕНИЕ ПОДТВЕРЖДЕНО\n"
+                f"{LINE}\n\n"
+                f"⏳ Интервал стабилизации: {remaining//60} мин {remaining%60} сек\n"
+                "▶ После истечения интервала станет доступна расшифровка.",
+                reply_markup=menu(uid)
             )
         else:
-            if time.time() - fixed_at < 600:
-                await q.edit_message_text(
-                    hdr() + "🟠 ФИКСАЦИЯ ПРИНЯТА\n⏳ Ожидание 10 минут",
-                    reply_markup=menu(uid)
-                )
-            else:
-                await q.edit_message_text(
-                    hdr() + "▶ ГОТОВО К РАСШИФРОВКЕ",
-                    reply_markup=decrypt_kb(aid)
-                )
+            await q.edit_message_text(
+                hdr() +
+                "🔎 ПАКЕТ ГОТОВ К РАСШИФРОВКЕ\n"
+                f"{LINE}\n\n"
+                "▶ Действие: открыть содержимое пакета.",
+                reply_markup=decrypt_kb(aid)
+            )
+        return
 
-    elif q.data == "TOP":
-        rows = conn.execute(
-            "SELECT username, points FROM users ORDER BY points DESC LIMIT 10"
-        ).fetchall()
-        txt = hdr() + "🏛 РЕЙТИНГ ДОСТУПА\n\n"
-        for i, (n, p) in enumerate(rows, 1):
-            txt += f"{i}. {n} — {p}\n"
-        await q.edit_message_text(txt, reply_markup=menu(uid))
-
-    elif q.data == "ADD_S" and uid == ADMIN_ID:
+    if q.data == "ADD_S" and uid == ADMIN_ID:
         WAITING_AUDIO.add(uid)
         await q.edit_message_text(
-            hdr() + "▶ ДОБАВЛЕНИЕ S-СИГНАЛА\nОтправьте аудио-файл."
+            hdr() +
+            "➕ (ADMIN) ДОБАВЛЕНИЕ CLASS S\n"
+            f"{LINE}\n\n"
+            "Отправьте аудио (mp3/voice).\n"
+            "Следующее аудио будет сохранено как архивный сигнал."
+        )
+        return
+
+    if q.data == "ADMIN_ANOM" and uid == ADMIN_ID:
+        await admin_spawn(context)
+        # мягкое подтверждение администратору
+        await q.edit_message_text(
+            hdr() +
+            "🟢 (ADMIN) РАССЫЛКА ПАКЕТА ВЫПОЛНЕНА\n"
+            f"{LINE}\n"
+            "Пакеты отправлены всем активным наблюдателям.",
+            reply_markup=menu(uid)
+        )
+        return
+
+# ================== ACK / DECRYPT ==================
+async def on_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    aid = int(q.data.split(":")[1])
+
+    conn = db()
+    # подтверждаем только если ещё SENT
+    conn.execute(
+        "UPDATE anomalies SET fixed_at=?, status='FIXED' WHERE id=? AND status='SENT'",
+        (int(time.time()), aid)
+    )
+    conn.commit()
+
+    # награда за подтверждение (минимальная)
+    add_points(conn, uid, 2)
+
+    await q.edit_message_text(
+        hdr() +
+        "🟠 ПОЛУЧЕНИЕ ПОДТВЕРЖДЕНО\n"
+        f"{LINE}\n\n"
+        "⏳ Требуется интервал стабилизации: 10 минут\n"
+        "▶ Затем: РАСШИФРОВАТЬ ПАКЕТ\n\n"
+        "✓ Индекс допуска: +2",
+        reply_markup=menu(uid)
+    )
+
+async def on_decrypt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    aid = int(q.data.split(":")[1])
+    conn = db()
+
+    row = conn.execute(
+        "SELECT kind, payload, fixed_at, status FROM anomalies WHERE id=? AND user_id=?",
+        (aid, uid)
+    ).fetchone()
+    if not row:
+        await q.edit_message_text(hdr() + "⛔ Пакет не найден.", reply_markup=menu(uid))
+        return
+
+    kind, payload, fixed_at, status = row
+    if status != "FIXED":
+        await q.edit_message_text(hdr() + "⛔ Расшифровка недоступна.", reply_markup=menu(uid))
+        return
+
+    waited = int(time.time()) - int(fixed_at or 0)
+    if waited < 600:
+        remaining = 600 - waited
+        await q.edit_message_text(
+            hdr() +
+            "🟠 РЕЖИМ СТАБИЛИЗАЦИИ\n"
+            f"{LINE}\n\n"
+            f"⏳ Осталось: {remaining//60} мин {remaining%60} сек\n"
+            "▶ Повторите попытку после истечения интервала.",
+            reply_markup=menu(uid)
+        )
+        return
+
+    # помечаем как DECRYPTED
+    conn.execute(
+        "UPDATE anomalies SET decrypted_at=?, status='DECRYPTED' WHERE id=?",
+        (int(time.time()), aid)
+    )
+    conn.commit()
+
+    if kind == "S_AUDIO":
+        await context.bot.send_audio(
+            chat_id=uid,
+            audio=payload,
+            caption=hdr() + "🟥 CLASS S // ARCHIVE SIGNAL\n" + f"{LINE}\n✓ Содержимое выдано отдельным пакетом."
+        )
+        reward = 5
+        result_text = (
+            hdr() +
+            "🟥 CLASS S ПОДТВЕРЖДЁН\n"
+            f"{LINE}\n\n"
+            "✓ Архивный сигнал выдан отдельным сообщением.\n"
+            f"✓ Индекс допуска: +{reward}"
+        )
+    else:
+        reward = 3
+        result_text = (
+            hdr() +
+            "🟢 РАСШИФРОВКА ВЫПОЛНЕНА\n"
+            f"{LINE}\n\n"
+            f"{payload}\n\n"
+            f"✓ Индекс допуска: +{reward}"
         )
 
-    elif q.data == "ADMIN_ANOM" and uid == ADMIN_ID:
-        await admin_spawn(context)
+    add_points(conn, uid, reward)
+    await q.edit_message_text(result_text, reply_markup=menu(uid))
 
-# ================== ADMIN ANOMALY ==================
-async def admin_spawn(context):
+# ================== ADMIN / SPAWN ==================
+async def admin_spawn(context: ContextTypes.DEFAULT_TYPE):
     conn = db()
-    for uid, _, _ in all_users(conn):
+    users = all_users(conn)
+    for uid, _, _ in users:
         pos, total = queue_position(conn, uid)
         chance = 0.15 + (1 - pos / max(1, total)) * 0.6
+
         if random.random() < chance:
             row = random_s_audio(conn)
             if row:
@@ -331,64 +530,17 @@ async def admin_spawn(context):
         try:
             await context.bot.send_message(
                 uid,
-                hdr() + "🔴 ОБНАРУЖЕНА АНОМАЛИЯ",
+                hdr() +
+                "🔴 НОВЫЙ ПАКЕТ ДАННЫХ\n"
+                f"{LINE}\n\n"
+                "▶ Откройте: 🔴 АКТИВНЫЙ ПАКЕТ\n"
+                "▶ Затем подтвердите получение.",
                 reply_markup=menu(uid)
             )
         except:
             pass
 
-# ================== FIX / DECRYPT ==================
-async def on_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    aid = int(q.data.split(":")[1])
-    conn = db()
-    conn.execute(
-        "UPDATE anomalies SET fixed_at=?, status='FIXED' WHERE id=?",
-        (int(time.time()), aid)
-    )
-    conn.commit()
-    add_points(conn, q.from_user.id, 2)
-    await q.edit_message_text(
-        hdr() + "🟢 ФИКСАЦИЯ ПРИНЯТА\n⏳ Ожидание 10 минут",
-        reply_markup=menu(q.from_user.id)
-    )
-
-async def on_decrypt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    aid = int(q.data.split(":")[1])
-    conn = db()
-    kind, payload = conn.execute(
-        "SELECT kind, payload FROM anomalies WHERE id=?",
-        (aid,)
-    ).fetchone()
-
-    if kind == "S_AUDIO":
-        await context.bot.send_audio(
-            q.from_user.id,
-            payload,
-            caption=hdr() + "🟥 CLASS S // ARCHIVE SIGNAL"
-        )
-        reward = 5
-    else:
-        await context.bot.send_message(
-            q.from_user.id,
-            hdr() + payload
-        )
-        reward = 3
-
-    conn.execute(
-        "UPDATE anomalies SET status='DECRYPTED' WHERE id=?",
-        (aid,)
-    )
-    conn.commit()
-    add_points(conn, q.from_user.id, reward)
-
-    await q.edit_message_text(
-        hdr() + f"🟢 РАСШИФРОВКА ЗАВЕРШЕНА\n▶ +{reward} ОЧКОВ",
-        reply_markup=menu(q.from_user.id)
-    )
-
-# ================== AUDIO ==================
+# ================== AUDIO UPLOAD ==================
 async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in WAITING_AUDIO:
@@ -396,7 +548,7 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if update.message.audio:
         fid = update.message.audio.file_id
-        title = update.message.audio.title or "S_SIGNAL"
+        title = update.message.audio.title or (update.message.audio.file_name or "S_SIGNAL")
     elif update.message.voice:
         fid = update.message.voice.file_id
         title = "S_SIGNAL_VOICE"
@@ -408,35 +560,46 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WAITING_AUDIO.remove(uid)
 
     await update.message.reply_text(
-        hdr() + "🟢 S-СИГНАЛ ДОБАВЛЕН",
+        hdr() +
+        "🟢 CLASS S ДОБАВЛЕН\n"
+        f"{LINE}\n"
+        f"Название: {title}\n"
+        "✓ Сигнал сохранён в архив.",
         reply_markup=menu(uid)
     )
 
 # ================== APP ==================
 def build_app():
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(on_fix, pattern=r"^FIX"))
-    app.add_handler(CallbackQueryHandler(on_decrypt, pattern=r"^DEC"))
+
+    app.add_handler(CallbackQueryHandler(on_ack, pattern=r"^ACK:"))
+    app.add_handler(CallbackQueryHandler(on_decrypt, pattern=r"^DEC:"))
     app.add_handler(CallbackQueryHandler(on_click))
+
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, on_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
     return app
 
 if __name__ == "__main__":
     application = build_app()
 
-    # 🔔 ежедневный официальный бюллетень
+    # 🔔 ежедневный официальный бюллетень (1 раз / 24ч)
     application.job_queue.run_repeating(
         send_daily_bulletin,
         interval=24 * 3600,
         first=300
     )
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="telegram",
-        webhook_url=f"{BASE_URL}/telegram",
-        drop_pending_updates=True
-    )
+    if BASE_URL:
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path="telegram",
+            webhook_url=f"{BASE_URL.rstrip('/')}/telegram",
+            drop_pending_updates=True
+        )
+    else:
+        application.run_polling(drop_pending_updates=True)
