@@ -178,7 +178,7 @@ def menu(uid: int):
         [InlineKeyboardButton("🔵 ВАША ПОЗИЦИЯ В ОЧЕРЕДИ", callback_data="Q")],
         [InlineKeyboardButton("🔴 АКТИВНЫЙ ПАКЕТ", callback_data="A")],
         [InlineKeyboardButton("🏛 РЕЙТИНГ", callback_data="TOP")],
-        [InlineKeyboardButton("ℹ️ ПОМОЩЬ / ПРОТОКОЛ", callback_data="HELP")],
+        #[InlineKeyboardButton("ℹ️ ПОМОЩЬ / ПРОТОКОЛ", callback_data="HELP")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton("🔴 (ADMIN) ЗАПУСТИТЬ ПАКЕТ", callback_data="ADMIN_ANOM")])
@@ -246,7 +246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WAITING_USERNAME.add(uid)
     await update.message.reply_text(
         hdr() +
-        "▶ ВЫ СОБИРАЕТЕСЬ ЗАРЕГИСТРИРОВАТЬСЯ В ЦИФРОВОЙ ОЧЕРЕДИ В НУЛЕВОЙ ЭДЕМ\n"
+        "▶ ВЫ СОБИРАЕТЕСЬ ЗАРЕГИСТРИРОВАТЬСЯ В ЦИФРОВОЙ ОЧЕРЕДИ В НУЛЕВОЙ ЭДЕМ\n\n"
         "Обладатели первых позиций в очереди будут публично отмечены на закрытой конференции NEZ Project 24.01.2026.\n\n"
         "Требования к ID:\n"
         "— латиница / цифры / . _ -\n"
