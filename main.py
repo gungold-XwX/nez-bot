@@ -3,7 +3,7 @@ import sqlite3
 import random
 import time
 import re
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -45,7 +45,7 @@ def db():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
-        username TEXT,
+        username TEXT UNIQUE,
         points INTEGER DEFAULT 0,
         created_at INTEGER
     )""")
@@ -96,12 +96,27 @@ def leaderboard(conn, limit=10):
         (limit,)
     ).fetchall()
 
+def ordered_users(conn) -> List[Tuple[int, str, int]]:
+    return conn.execute(
+        "SELECT user_id, username, points FROM users ORDER BY points DESC, created_at ASC"
+    ).fetchall()
+
 def queue_position(conn, uid) -> Tuple[int, int]:
     ids = [r[0] for r in conn.execute(
         "SELECT user_id FROM users ORDER BY points DESC, created_at ASC"
     )]
     total = len(ids)
     return (ids.index(uid) + 1, total) if uid in ids else (total + 1, total)
+
+def neighbors(conn, uid, window=2):
+    rows = ordered_users(conn)
+    ids = [r[0] for r in rows]
+    if uid not in ids:
+        return [], []
+    idx = ids.index(uid)
+    above = rows[max(0, idx - window): idx]
+    below = rows[idx + 1: idx + 1 + window]
+    return above, below
 
 # ================== VALIDATION ==================
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,20}$")
@@ -115,6 +130,9 @@ def random_s_audio(conn) -> Optional[Tuple[str, str]]:
     return conn.execute(
         "SELECT title, file_id FROM s_audio ORDER BY RANDOM() LIMIT 1"
     ).fetchone()
+
+def s_audio_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM s_audio").fetchone()[0]
 
 # ================== ANOMALIES ==================
 NOCLASS = [
@@ -139,6 +157,18 @@ def get_active_anomaly(conn, uid):
     WHERE user_id=? AND status IN ('SENT','FIXED')
     ORDER BY created_at DESC LIMIT 1
     """, (uid,)).fetchone()
+
+# ================== PROBABILITY (DISPLAY) ==================
+def s_chance(pos: int, total: int) -> float:
+    # как в спавне: 0.15..0.75 (примерно)
+    return 0.15 + (1 - pos / max(1, total)) * 0.6
+
+def s_chance_label(ch: float) -> str:
+    if ch >= 0.55:
+        return "ВЫСОКАЯ"
+    if ch >= 0.35:
+        return "СРЕДНЯЯ"
+    return "НИЗКАЯ"
 
 # ================== BULLETIN ==================
 def build_bulletin(conn):
@@ -175,14 +205,15 @@ async def send_daily_bulletin(context: ContextTypes.DEFAULT_TYPE):
 # ================== UI ==================
 def menu(uid: int):
     rows = [
-        [InlineKeyboardButton("🔵 ВАША ПОЗИЦИЯ В ОЧЕРЕДИ", callback_data="Q")],
+        [InlineKeyboardButton("🔵 СТАТУС ОЧЕРЕДИ", callback_data="Q")],
         [InlineKeyboardButton("🔴 АКТИВНЫЙ ПАКЕТ", callback_data="A")],
         [InlineKeyboardButton("🏛 РЕЙТИНГ", callback_data="TOP")],
-        #[InlineKeyboardButton("ℹ️ ПОМОЩЬ / ПРОТОКОЛ", callback_data="HELP")],
+        [InlineKeyboardButton("ℹ️ ПОМОЩЬ / ПРОТОКОЛ", callback_data="HELP")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton("🔴 (ADMIN) ЗАПУСТИТЬ ПАКЕТ", callback_data="ADMIN_ANOM")])
-        rows.append([InlineKeyboardButton("➕ (ADMIN) ДОБАВИТЬ S-СИГНАЛ", callback_data="ADD_S")])
+        rows.append([InlineKeyboardButton("➕ (ADMIN) РЕЖИМ ДОБАВЛЕНИЯ S", callback_data="ADD_S_ON")])
+        rows.append([InlineKeyboardButton("⏹ (ADMIN) ВЫЙТИ ИЗ РЕЖИМА S", callback_data="ADD_S_OFF")])
     return InlineKeyboardMarkup(rows)
 
 def confirm_kb(aid: int):
@@ -196,7 +227,7 @@ def decrypt_kb(aid: int):
     ])
 
 WAITING_USERNAME = set()
-WAITING_AUDIO = set()
+S_ADD_MODE = set()   # админ может держать режим постоянно
 
 # ================== HELP TEXT ==================
 def help_text():
@@ -206,16 +237,15 @@ def help_text():
         f"{LINE}\n\n"
         "Что это:\n"
         "— цифровая очередь доступа к объекту EDEN-0\n"
-        "— система ведёт ранжирование наблюдателей\n\n"
+        "— NEZ ранжирует наблюдателей по надёжности\n\n"
         "Почему вы продвигаетесь:\n"
-        "— NEZ не выдаёт доступ всем сразу\n"
         "— очередь пересчитывается по Индексу допуска (IDx)\n"
-        "— IDx растёт, когда вы быстро и корректно подтверждаете пакеты и проходите расшифровку\n\n"
+        "— IDx растёт, когда вы подтверждаете получение пакетов и проходите расшифровку\n\n"
         "Как действовать:\n"
         "1) появляется 🔴 АКТИВНЫЙ ПАКЕТ\n"
-        "2) нажмите ✅ ПОДТВЕРДИТЬ ПОЛУЧЕНИЕ (это регистрация реакции наблюдателя)\n"
-        "3) выдержите интервал ⏳ 10 минут\n"
-        "4) нажмите 🔎 РАСШИФРОВАТЬ ПАКЕТ\n\n"
+        "2) ✅ подтвердить получение\n"
+        "3) ⏳ выдержать 10 минут\n"
+        "4) 🔎 расшифровать пакет\n\n"
         "Классы:\n"
         "— NOCLASS: шум/обрывки\n"
         "— CLASS S: архивный сигнал (аудио). Чем выше очередь — тем выше шанс.\n\n"
@@ -232,12 +262,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if u:
         pos, total = queue_position(conn, uid)
+        ch = s_chance(pos, total)
         await update.message.reply_text(
             hdr() +
             "🟢 ДОСТУП АКТИВЕН\n\n"
             f"ID: {u[1]}\n"
             f"Позиция: {pos} / {total}\n"
             f"Индекс допуска (IDx): {u[2]}\n"
+            f"Вероятность CLASS S: {s_chance_label(ch)}\n"
             + footer_hint(),
             reply_markup=menu(uid)
         )
@@ -246,13 +278,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WAITING_USERNAME.add(uid)
     await update.message.reply_text(
         hdr() +
-        "▶ ВЫ СОБИРАЕТЕСЬ ЗАРЕГИСТРИРОВАТЬСЯ В ЦИФРОВОЙ ОЧЕРЕДИ В НУЛЕВОЙ ЭДЕМ\n\n"
-        "Обладатели первых позиций в очереди будут публично отмечены на закрытой конференции NEZ Project 24.01.2026.\n\n"
+        "▶ РЕГИСТРАЦИЯ ДОСТУПА\n"
+        f"{LINE}\n\n"
+        "Первые позиции очереди будут публично отмечены.\n"
+        "Поздравление проводит глава NEZ на специальном мероприятии.\n\n"
         "Требования к ID:\n"
         "— латиница / цифры / . _ -\n"
         "— длина 3–20\n"
-        "— ID невозможно изменить после регистрации\n\n"
-        "Введите ID (пример: metaego):"
+        "— ID не изменяется после регистрации\n\n"
+        "Введите ID (пример: metaego_01):"
     )
 
 # ================== TEXT INPUT ==================
@@ -275,7 +309,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     conn = db()
-    # защита от повторов (чтобы не было одинаковых ников)
     exists = conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone()
     if exists:
         await update.message.reply_text(
@@ -319,17 +352,31 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(hdr() + "⛔ Требуется регистрация. Нажмите /start")
             return
         pos, total = queue_position(conn, uid)
-        await q.edit_message_text(
+        ch = s_chance(pos, total)
+        above, below = neighbors(conn, uid, window=2)
+
+        def fmt(rows, prefix):
+            if not rows:
+                return f"{prefix} нет\n"
+            out = ""
+            for r in rows:
+                # r = (user_id, username, points)
+                out += f"  {r[1]} — {r[2]} IDx\n"
+            return out
+
+        txt = (
             hdr() +
             "🔵 СТАТУС ОЧЕРЕДИ\n"
             f"{LINE}\n\n"
             f"ID: {u[1]}\n"
             f"Позиция: {pos} / {total}\n"
-            f"Индекс допуска (IDx): {u[2]}\n\n"
-            "▶ Чем выше IDx — тем выше шанс CLASS S.\n"
-            + footer_hint(),
-            reply_markup=menu(uid)
+            f"Индекс допуска (IDx): {u[2]}\n"
+            f"Вероятность CLASS S: {s_chance_label(ch)}\n\n"
+            "▲ Соседи выше:\n" + fmt(above, "▲") +
+            "\n▽ Соседи ниже:\n" + fmt(below, "▽") +
+            "\n▶ IDx растёт через пакеты: подтверждение + расшифровка."
         )
+        await q.edit_message_text(txt, reply_markup=menu(uid))
         return
 
     if q.data == "TOP":
@@ -366,7 +413,6 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # FIXED
         waited = int(time.time()) - int(fixed_at or 0)
         remaining = max(0, 600 - waited)
         if remaining > 0:
@@ -388,20 +434,36 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if q.data == "ADD_S" and uid == ADMIN_ID:
-        WAITING_AUDIO.add(uid)
+    # ADMIN: режим добавления S
+    if q.data == "ADD_S_ON" and uid == ADMIN_ID:
+        S_ADD_MODE.add(uid)
+        count = s_audio_count(conn)
         await q.edit_message_text(
             hdr() +
-            "➕ (ADMIN) ДОБАВЛЕНИЕ CLASS S\n"
+            "➕ (ADMIN) РЕЖИМ ДОБАВЛЕНИЯ CLASS S\n"
             f"{LINE}\n\n"
-            "Отправьте аудио (mp3/voice).\n"
-            "Следующее аудио будет сохранено как архивный сигнал."
+            "Режим включён.\n"
+            "▶ Просто отправляйте аудио подряд — каждое будет сохранено.\n"
+            f"Сейчас в архиве: {count} сигналов.\n\n"
+            "Для выхода нажмите ⏹ (ADMIN) ВЫЙТИ ИЗ РЕЖИМА S.",
+            reply_markup=menu(uid)
+        )
+        return
+
+    if q.data == "ADD_S_OFF" and uid == ADMIN_ID:
+        S_ADD_MODE.discard(uid)
+        count = s_audio_count(conn)
+        await q.edit_message_text(
+            hdr() +
+            "⏹ (ADMIN) РЕЖИМ CLASS S ОТКЛЮЧЁН\n"
+            f"{LINE}\n\n"
+            f"Сейчас в архиве: {count} сигналов.",
+            reply_markup=menu(uid)
         )
         return
 
     if q.data == "ADMIN_ANOM" and uid == ADMIN_ID:
         await admin_spawn(context)
-        # мягкое подтверждение администратору
         await q.edit_message_text(
             hdr() +
             "🟢 (ADMIN) РАССЫЛКА ПАКЕТА ВЫПОЛНЕНА\n"
@@ -419,22 +481,20 @@ async def on_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     aid = int(q.data.split(":")[1])
 
     conn = db()
-    # подтверждаем только если ещё SENT
     conn.execute(
         "UPDATE anomalies SET fixed_at=?, status='FIXED' WHERE id=? AND status='SENT'",
         (int(time.time()), aid)
     )
     conn.commit()
 
-    # награда за подтверждение (минимальная)
     add_points(conn, uid, 2)
 
     await q.edit_message_text(
         hdr() +
         "🟠 ПОЛУЧЕНИЕ ПОДТВЕРЖДЕНО\n"
         f"{LINE}\n\n"
-        "⏳ Требуется интервал стабилизации: 10 минут\n"
-        "▶ Затем: РАСШИФРОВАТЬ ПАКЕТ\n\n"
+        "⏳ Интервал стабилизации: 10 минут\n"
+        "▶ Затем: 🔎 РАСШИФРОВАТЬ ПАКЕТ\n\n"
         "✓ Индекс допуска: +2",
         reply_markup=menu(uid)
     )
@@ -472,7 +532,6 @@ async def on_decrypt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # помечаем как DECRYPTED
     conn.execute(
         "UPDATE anomalies SET decrypted_at=?, status='DECRYPTED' WHERE id=?",
         (int(time.time()), aid)
@@ -512,7 +571,7 @@ async def admin_spawn(context: ContextTypes.DEFAULT_TYPE):
     users = all_users(conn)
     for uid, _, _ in users:
         pos, total = queue_position(conn, uid)
-        chance = 0.15 + (1 - pos / max(1, total)) * 0.6
+        chance = s_chance(pos, total)
 
         if random.random() < chance:
             row = random_s_audio(conn)
@@ -541,7 +600,7 @@ async def admin_spawn(context: ContextTypes.DEFAULT_TYPE):
 # ================== AUDIO UPLOAD ==================
 async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid not in WAITING_AUDIO:
+    if uid != ADMIN_ID or uid not in S_ADD_MODE:
         return
 
     if update.message.audio:
@@ -555,14 +614,16 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     add_s_audio(conn, title, fid)
-    WAITING_AUDIO.remove(uid)
+    count = s_audio_count(conn)
 
     await update.message.reply_text(
         hdr() +
         "🟢 CLASS S ДОБАВЛЕН\n"
         f"{LINE}\n"
         f"Название: {title}\n"
-        "✓ Сигнал сохранён в архив.",
+        f"Архив: {count} сигналов.\n\n"
+        "▶ Можно отправлять следующее аудио.\n"
+        "Для выхода: ⏹ (ADMIN) ВЫЙТИ ИЗ РЕЖИМА S.",
         reply_markup=menu(uid)
     )
 
@@ -571,7 +632,6 @@ def build_app():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-
     app.add_handler(CallbackQueryHandler(on_ack, pattern=r"^ACK:"))
     app.add_handler(CallbackQueryHandler(on_decrypt, pattern=r"^DEC:"))
     app.add_handler(CallbackQueryHandler(on_click))
