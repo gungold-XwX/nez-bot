@@ -133,11 +133,16 @@ def get_active_anomaly(conn, uid):
     LIMIT 1
     """, (uid,)).fetchone()
 
+# NEW: always keep only 1 active packet per user
+def expire_active_anomalies(conn, uid):
+    conn.execute(
+        "UPDATE anomalies SET status='EXPIRED' WHERE user_id=? AND status IN ('NEW','FIXED')",
+        (uid,)
+    )
+    conn.commit()
+
 # ================== SCORE (FAST CONFIRM) ==================
-# важность "каждой минуты" реализуем как бонус по скорости подтверждения
 def confirm_points(elapsed_sec: int) -> int:
-    # чем быстрее подтвердил после рассылки — тем больше очков
-    # 0–5 сек: 8, 6–10: 7, 11–20: 6, 21–30: 5, 31–45: 4, 46–60: 3, 61–120: 2, дальше: 1
     if elapsed_sec <= 5:
         return 8
     if elapsed_sec <= 10:
@@ -249,8 +254,6 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pos, total = queue_position(conn, uid)
 
         above, below = queue_neighbors(conn, uid, window=2)
-
-        # добавляем соседей без изменения твоих строк (просто дописываем блок ниже)
         neigh = ""
         if above or below:
             neigh += "\n\nСоседи:\n"
@@ -298,13 +301,11 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             add_points(conn, uid, pts)
 
-            # текст оставляем тем же, меняем только "10 минут" -> "1 минуту" ради правды
             await q.edit_message_text(
                 "Пакет подтверждён.\nОжидайте 1 минуту.",
                 reply_markup=menu(uid)
             )
         else:
-            # стабилизация теперь 60 секунд
             if time.time() - fixed_at < 60:
                 await q.edit_message_text("Стабилизация…", reply_markup=menu(uid))
             else:
@@ -355,6 +356,9 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
     users = ordered_users(conn)
 
     for uid, _, _ in users:
+        # always keep only 1 active packet per user
+        expire_active_anomalies(conn, uid)
+
         if random.random() < 0.25:
             fid = random_s_audio(conn)
             if fid:
