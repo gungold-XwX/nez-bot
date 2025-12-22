@@ -126,8 +126,8 @@ def get_active_anomaly(conn, uid):
 # ================== UI ==================
 def menu(uid):
     rows = [
-        [InlineKeyboardButton("Очередь", callback_data="Q")],
-        [InlineKeyboardButton("Активный пакет", callback_data="A")],
+        [InlineKeyboardButton("Позиция в очереди", callback_data="Q")],
+        [InlineKeyboardButton("Активный пакет данных", callback_data="A")],
         [InlineKeyboardButton("Рейтинг", callback_data="TOP")],
         [InlineKeyboardButton("Помощь", callback_data="HELP")],
     ]
@@ -162,7 +162,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     WAIT_USERNAME.add(uid)
     await update.message.reply_text(
         hdr() +
-        "Регистрация доступа.\n\n"
+        "Вы регистрируетесь в цифровой очереди в Нулевой Эдем (EDEN-0).\n\n"
+        "ID обладателей первых трех позиций в очереди будут публично отмечены на специальной конференции NEZ Project 24.01.26.\n\n"
         "Введите ID (латиница, 3–20):"
     )
 
@@ -208,7 +209,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Подтверждение и расшифровка пакетов данных повышают ваш индекс допуска\n"
             "• Чем быстрее вы подтвердите и расшифруете присланный пакет данных, тем сильнее повысится ваш индекс допуска\n"
             "• Чем выше индекс допуска — тем выше ваша позиция в очереди\n"
-            "• Обладатели первых трех позиций в очереди будут отмечены публично",
+            "• Обладатели первых трех позиций в очереди будут отмечены публично на специальной конференции NEZ Project 24.01.26. metaego-asterasounds2401.ticketscloud.org",
             reply_markup=menu(uid)
         )
 
