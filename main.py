@@ -89,6 +89,16 @@ def queue_position(conn, uid) -> Tuple[int, int]:
     total = len(ids)
     return (ids.index(uid) + 1, total) if uid in ids else (total + 1, total)
 
+def queue_neighbors(conn, uid, window: int = 2):
+    rows = ordered_users(conn)  # (user_id, username, points)
+    ids = [r[0] for r in rows]
+    if uid not in ids:
+        return [], []
+    i = ids.index(uid)
+    above = rows[max(0, i - window): i]
+    below = rows[i + 1: i + 1 + window]
+    return above, below
+
 # ================== S AUDIO ==================
 def add_s_audio(conn, fid):
     conn.execute("INSERT INTO s_audio (file_id) VALUES (?)", (fid,))
@@ -116,12 +126,33 @@ def create_anomaly(conn, uid, kind, payload):
 
 def get_active_anomaly(conn, uid):
     return conn.execute("""
-    SELECT id, kind, payload, status, fixed_at
+    SELECT id, kind, payload, status, fixed_at, created_at
     FROM anomalies
     WHERE user_id=? AND status IN ('NEW','FIXED')
     ORDER BY created_at DESC
     LIMIT 1
     """, (uid,)).fetchone()
+
+# ================== SCORE (FAST CONFIRM) ==================
+# важность "каждой минуты" реализуем как бонус по скорости подтверждения
+def confirm_points(elapsed_sec: int) -> int:
+    # чем быстрее подтвердил после рассылки — тем больше очков
+    # 0–5 сек: 8, 6–10: 7, 11–20: 6, 21–30: 5, 31–45: 4, 46–60: 3, 61–120: 2, дальше: 1
+    if elapsed_sec <= 5:
+        return 8
+    if elapsed_sec <= 10:
+        return 7
+    if elapsed_sec <= 20:
+        return 6
+    if elapsed_sec <= 30:
+        return 5
+    if elapsed_sec <= 45:
+        return 4
+    if elapsed_sec <= 60:
+        return 3
+    if elapsed_sec <= 120:
+        return 2
+    return 1
 
 # ================== UI ==================
 def menu(uid):
@@ -216,11 +247,26 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "Q":
         user = get_user(conn, uid)
         pos, total = queue_position(conn, uid)
+
+        above, below = queue_neighbors(conn, uid, window=2)
+
+        # добавляем соседей без изменения твоих строк (просто дописываем блок ниже)
+        neigh = ""
+        if above or below:
+            neigh += "\n\nСоседи:\n"
+            if above:
+                for r in above:
+                    neigh += f"▲ {r[1]} — {r[2]}\n"
+            if below:
+                for r in below:
+                    neigh += f"▼ {r[1]} — {r[2]}\n"
+
         await q.edit_message_text(
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска: {user[2]}",
+            f"Индекс допуска: {user[2]}"
+            + neigh,
             reply_markup=menu(uid)
         )
 
@@ -237,21 +283,29 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Активных пакетов нет.", reply_markup=menu(uid))
             return
 
-        aid, kind, payload, status, fixed_at = a
+        aid, kind, payload, status, fixed_at, created_at = a
 
         if status == "NEW":
+            now = int(time.time())
+            elapsed = max(0, now - int(created_at or now))
+            pts = confirm_points(elapsed)
+
             conn.execute(
                 "UPDATE anomalies SET status='FIXED', fixed_at=? WHERE id=?",
-                (int(time.time()), aid)
+                (now, aid)
             )
             conn.commit()
-            add_points(conn, uid, 1)
+
+            add_points(conn, uid, pts)
+
+            # текст оставляем тем же, меняем только "10 минут" -> "1 минуту" ради правды
             await q.edit_message_text(
-                "Пакет подтверждён.\nОжидайте 10 минут.",
+                "Пакет подтверждён.\nОжидайте 1 минуту.",
                 reply_markup=menu(uid)
             )
         else:
-            if time.time() - fixed_at < 600:
+            # стабилизация теперь 60 секунд
+            if time.time() - fixed_at < 60:
                 await q.edit_message_text("Стабилизация…", reply_markup=menu(uid))
             else:
                 if kind == "S":
@@ -334,4 +388,3 @@ if __name__ == "__main__":
         )
     else:
         application.run_polling()
-
