@@ -112,9 +112,8 @@ def random_s_audio(conn) -> Optional[str]:
 
 # ================== ANOMALIES ==================
 NOCLASS_TEXT = [
-    "данные повреждены",
-    "содержимое утеряно",
-    "шум сигнала",
+    "Пакет расшифрован: данные повреждены",
+    "Пакет расшифрован: содержимое утеряно",
 ]
 
 def create_anomaly(conn, uid, kind, payload):
@@ -275,7 +274,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "TOP":
         rows = ordered_users(conn)[:10]
-        text = hdr() + "Топ доступа:\n\n"
+        text = hdr() + "Обладатели первых позиций в очереди:\n\n"
         for i, r in enumerate(rows, 1):
             text += f"{i}. {r[1]} — {r[2]}\n"
         await q.edit_message_text(text, reply_markup=menu(uid))
@@ -283,7 +282,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "A":
         a = get_active_anomaly(conn, uid)
         if not a:
-            await q.edit_message_text("Активных пакетов нет.", reply_markup=menu(uid))
+            await q.edit_message_text("Вы еще не получили новый пакет данных от NEZ Project.", reply_markup=menu(uid))
             return
 
         aid, kind, payload, status, fixed_at, created_at = a
@@ -302,12 +301,12 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             add_points(conn, uid, pts)
 
             await q.edit_message_text(
-                "Пакет подтверждён.\nОжидайте 1 минуту.",
+                "Вы подтвердили получение нового пакета данных от NEZ Project.\nРасшифровка пакета займет 1 минуту.",
                 reply_markup=menu(uid)
             )
         else:
             if time.time() - fixed_at < 60:
-                await q.edit_message_text("Стабилизация…", reply_markup=menu(uid))
+                await q.edit_message_text("Происходит расшифровка пакета данных… Пожалуйста, подождите.", reply_markup=menu(uid))
             else:
                 if kind == "S":
                     await context.bot.send_audio(uid, payload)
