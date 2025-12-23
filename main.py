@@ -366,7 +366,7 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
         create_anomaly(conn, uid, "N", random.choice(NOCLASS_TEXT))
 
         try:
-            await context.bot.send_message(uid, "Новый пакет доступен.")
+            await context.bot.send_message(uid, "Новый пакет данных от NEZ Project доступен.")
         except:
             pass
 
