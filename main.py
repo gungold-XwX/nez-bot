@@ -97,26 +97,19 @@ def create_user(conn, uid, name):
     )
     conn.commit()
 
-def add_points(conn, uid, pts_delta: int):
-    # clamp at 0 so index doesn't go negative
-    conn.execute(
-        "UPDATE users SET points = CASE WHEN points + ? < 0 THEN 0 ELSE points + ? END WHERE user_id=?",
-        (pts_delta, pts_delta, uid)
-    )
-    conn.commit()
-
 def ordered_users(conn):
     return conn.execute(
-        "SELECT user_id, username, points FROM users ORDER BY points DESC, created_at ASC"
+        "SELECT user_id, username, points, created_at FROM users ORDER BY points DESC, created_at ASC"
     ).fetchall()
 
 def queue_position(conn, uid) -> Tuple[int, int]:
-    ids = [r[0] for r in ordered_users(conn)]
+    rows = ordered_users(conn)
+    ids = [r[0] for r in rows]
     total = len(ids)
     return (ids.index(uid) + 1, total) if uid in ids else (total + 1, total)
 
 def queue_neighbors(conn, uid, window: int = 2):
-    rows = ordered_users(conn)  # (user_id, username, points)
+    rows = ordered_users(conn)  # (user_id, username, points, created_at)
     ids = [r[0] for r in rows]
     if uid not in ids:
         return [], []
@@ -125,7 +118,7 @@ def queue_neighbors(conn, uid, window: int = 2):
     below = rows[i + 1: i + 1 + window]
     return above, below
 
-def neighbor_above(conn, uid) -> Optional[Tuple[int, str, int]]:
+def neighbor_above(conn, uid) -> Optional[Tuple[int, str, int, int]]:
     rows = ordered_users(conn)
     ids = [r[0] for r in rows]
     if uid not in ids:
@@ -133,7 +126,17 @@ def neighbor_above(conn, uid) -> Optional[Tuple[int, str, int]]:
     i = ids.index(uid)
     if i == 0:
         return None
-    return rows[i - 1]  # (user_id, username, points)
+    return rows[i - 1]  # (user_id, username, points, created_at)
+
+def set_points(conn, uid: int, value: int):
+    if value < 0:
+        value = 0
+    conn.execute("UPDATE users SET points=? WHERE user_id=?", (value, uid))
+    conn.commit()
+
+def set_created_at(conn, uid: int, value: int):
+    conn.execute("UPDATE users SET created_at=? WHERE user_id=?", (value, uid))
+    conn.commit()
 
 # ================== USER META (COOLDOWN) ==================
 def ensure_user_meta(conn, uid: int):
@@ -194,7 +197,6 @@ def get_active_anomaly(conn, uid):
     LIMIT 1
     """, (uid,)).fetchone()
 
-# always keep only 1 active packet per user
 def expire_active_anomalies(conn, uid):
     conn.execute(
         "UPDATE anomalies SET status='EXPIRED' WHERE user_id=? AND status IN ('NEW','FIXED')",
@@ -245,7 +247,6 @@ def set_duel_status(conn, duel_id: int, status: str, winner_id: int = 0):
     conn.commit()
 
 def mark_expired_if_ttl(conn, duel_row) -> bool:
-    # returns True if expired now
     duel_id, challenger_id, target_id, created_at, status, winner_id = duel_row
     if status != "PENDING":
         return False
@@ -253,6 +254,33 @@ def mark_expired_if_ttl(conn, duel_row) -> bool:
         set_duel_status(conn, duel_id, "EXPIRED", 0)
         return True
     return False
+
+def swap_positions_one_step(conn, winner_id: int, loser_id: int):
+    """
+    Duel is always with neighbor above (loser_id may be above or below depending on winner),
+    but we enforce "swap order between these two" (i.e., winner +1 position, loser -1).
+    We do it by adjusting points minimally, and fallback to swapping created_at if points==0 edge case.
+    """
+    w = get_user(conn, winner_id)  # (id, username, points, created_at)
+    l = get_user(conn, loser_id)
+
+    if not w or not l:
+        return
+
+    w_pts, w_ct = int(w[2]), int(w[3])
+    l_pts, l_ct = int(l[2]), int(l[3])
+
+    # If loser has >0 points, winner gets loser's points, loser gets -1 from that level.
+    # This makes winner just above loser without jumping over tie-group above (created_at keeps it stable).
+    if l_pts > 0:
+        set_points(conn, winner_id, l_pts)
+        set_points(conn, loser_id, l_pts - 1)
+        return
+
+    # Edge: loser has 0 points (both likely near bottom). Swap created_at to flip their relative order.
+    # Keep points unchanged.
+    set_created_at(conn, winner_id, l_ct)
+    set_created_at(conn, loser_id, w_ct)
 
 # ================== UI ==================
 def menu(uid):
@@ -270,6 +298,12 @@ def menu(uid):
 def duel_request_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Запросить сдвиг квоты (сосед выше)", callback_data="DUEL_REQ")]
+    ])
+
+def duel_confirm_kb(target_id: int):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Подтвердить запрос", callback_data=f"DUEL_REQ_OK:{target_id}")],
+        [InlineKeyboardButton("Отмена", callback_data="DUEL_REQ_CANCEL")]
     ])
 
 def duel_invite_kb(duel_id: int):
@@ -345,9 +379,8 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     conn = db()
 
-    # ====== DUEL: request (quota shift) ======
+    # ====== DUEL: step 1 — show confirmation window ======
     if q.data == "DUEL_REQ":
-        # cooldown check
         now = int(time.time())
         until = get_duel_cooldown_until(conn, uid)
         if now < until:
@@ -365,21 +398,84 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        target_id, target_name, _ = above
+        target_id, target_name, _, _ = above
+
+        await q.edit_message_text(
+            "Запрос на сдвиг квоты будет отправлен наблюдателю выше по очереди.\n\n"
+            "Если адресат подтвердит участие, NEZ выполнит пересчёт квоты.\n"
+            "По результату пересчёта позиции в очереди будут скорректированы:\n"
+            "• один участник поднимется на 1 место\n"
+            "• второй участник опустится на 1 место\n\n"
+            "Адресат может отклонить запрос без последствий.\n"
+            "Частота пересчётов ограничена.",
+            reply_markup=duel_confirm_kb(target_id)
+        )
+        return
+
+    if q.data == "DUEL_REQ_CANCEL":
+        user = get_user(conn, uid)
+        pos, total = queue_position(conn, uid)
+
+        above, below = queue_neighbors(conn, uid, window=2)
+        neigh = ""
+        if above or below:
+            neigh += "\n\nСоседи:\n"
+            if above:
+                for r in above:
+                    neigh += f"▲ {r[1]} — {r[2]}\n"
+            if below:
+                for r in below:
+                    neigh += f"▼ {r[1]} — {r[2]}\n"
+
+        await q.edit_message_text(
+            hdr() +
+            f"ID: {user[1]}\n"
+            f"Позиция: {pos}/{total}\n"
+            f"Индекс допуска: {user[2]}"
+            + neigh,
+            reply_markup=InlineKeyboardMarkup(
+                (menu(uid).inline_keyboard + duel_request_kb().inline_keyboard)
+            )
+        )
+        return
+
+    # ====== DUEL: step 2 — actually send request after confirm ======
+    if q.data.startswith("DUEL_REQ_OK:"):
+        try:
+            target_id = int(q.data.split(":", 1)[1])
+        except:
+            await q.edit_message_text("Запрос недействителен.", reply_markup=menu(uid))
+            return
+
+        now = int(time.time())
+        until = get_duel_cooldown_until(conn, uid)
+        if now < until:
+            await q.edit_message_text(
+                "Окно пересчёта квоты недоступно. Повторите позже.",
+                reply_markup=menu(uid)
+            )
+            return
+
+        above = neighbor_above(conn, uid)
+        if not above or above[0] != target_id:
+            await q.edit_message_text(
+                "Запрос невозможен: вышестоящий слот изменился.",
+                reply_markup=menu(uid)
+            )
+            return
+
         duel_id = create_duel(conn, uid, target_id)
 
-        # Put both on cooldown to prevent farming (request counted)
+        # cooldown for both (as in your current logic)
         set_duel_cooldown(conn, uid)
         set_duel_cooldown(conn, target_id)
 
-        # notify challenger
         await q.edit_message_text(
             "Запрос на сдвиг квоты сформирован.\n"
             "Ожидание подтверждения адресата.",
             reply_markup=menu(uid)
         )
 
-        # send invite to target
         try:
             await context.bot.send_message(
                 chat_id=target_id,
@@ -389,7 +485,6 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=duel_invite_kb(duel_id)
             )
         except:
-            # if target can't be reached, expire request and notify challenger
             set_duel_status(conn, duel_id, "EXPIRED", 0)
             try:
                 await context.bot.send_message(
@@ -412,12 +507,10 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         duel_id_db, challenger_id, target_id, created_at, status, winner_id = duel_row
 
-        # only target can respond
         if uid != target_id:
             await q.edit_message_text("Недостаточно прав доступа.", reply_markup=menu(uid))
             return
 
-        # expire if too old
         if mark_expired_if_ttl(conn, duel_row):
             await q.edit_message_text("Запрос истёк. Пересчёт не выполнен.", reply_markup=menu(uid))
             try:
@@ -446,28 +539,51 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ACCEPT: random resolution
-        # winner: either challenger or target
         winner = challenger_id if random.random() < 0.5 else target_id
+        loser = target_id if winner == challenger_id else challenger_id
+
+        # capture old positions
+        old_pos_w, total = queue_position(conn, winner)
+        old_pos_l, _ = queue_position(conn, loser)
+
         set_duel_status(conn, duel_id, "DONE", winner)
 
-        # rule: if invited wins -> invited +1, challenger -1; else opposite
-        if winner == target_id:
-            add_points(conn, target_id, +1)
-            add_points(conn, challenger_id, -1)
-        else:
-            add_points(conn, challenger_id, +1)
-            add_points(conn, target_id, -1)
+        # swap by one position (winner up, loser down)
+        swap_positions_one_step(conn, winner, loser)
 
-        await q.edit_message_text(
-            "Пересчёт квоты выполнен.\nРезультат: квота перераспределена.",
-            reply_markup=menu(uid)
+        # new positions
+        new_pos_w, total2 = queue_position(conn, winner)
+        new_pos_l, _ = queue_position(conn, loser)
+
+        w_user = get_user(conn, winner)
+        l_user = get_user(conn, loser)
+        w_name = w_user[1] if w_user else "UNKNOWN"
+        l_name = l_user[1] if l_user else "UNKNOWN"
+
+        # result text (shown to both)
+        result_text = (
+            "Пересчёт квоты выполнен.\n"
+            "Результат: квота перераспределена.\n\n"
+            f"Поднялся: {w_name} ({old_pos_w} → {new_pos_w})\n"
+            f"Опустился: {l_name} ({old_pos_l} → {new_pos_l})"
         )
 
-        # notify challenger
+        await q.edit_message_text(result_text, reply_markup=menu(uid))
+
+        # notify challenger too
         try:
             await context.bot.send_message(
                 chat_id=challenger_id,
-                text="Пересчёт квоты выполнен.\nРезультат: квота перераспределена."
+                text=result_text
+            )
+        except:
+            pass
+
+        # notify target too (in case callback edit is not seen later)
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=result_text
             )
         except:
             pass
@@ -502,7 +618,6 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for r in below:
                     neigh += f"▼ {r[1]} — {r[2]}\n"
 
-        # Add duel button here (separate message UI) without changing existing text.
         await q.edit_message_text(
             hdr() +
             f"ID: {user[1]}\n"
@@ -540,7 +655,12 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             conn.commit()
 
-            add_points(conn, uid, pts)
+            # keep your original behavior: fast confirm adds points (index)
+            conn.execute(
+                "UPDATE users SET points = points + ? WHERE user_id=?",
+                (pts, uid)
+            )
+            conn.commit()
 
             await q.edit_message_text(
                 "Вы подтвердили получение нового пакета данных от NEZ Project.\nРасшифровка пакета займет 1 минуту.",
@@ -552,15 +672,14 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 if kind == "S":
                     await context.bot.send_audio(uid, payload)
-                    add_points(conn, uid, 4)
+                    conn.execute("UPDATE users SET points = points + 4 WHERE user_id=?", (uid,))
+                    conn.commit()
                 else:
                     await context.bot.send_message(uid, payload)
-                    add_points(conn, uid, 2)
+                    conn.execute("UPDATE users SET points = points + 2 WHERE user_id=?", (uid,))
+                    conn.commit()
 
-                conn.execute(
-                    "UPDATE anomalies SET status='DONE' WHERE id=?",
-                    (aid,)
-                )
+                conn.execute("UPDATE anomalies SET status='DONE' WHERE id=?", (aid,))
                 conn.commit()
 
                 await q.edit_message_text(
@@ -596,8 +715,7 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
     conn = db()
     users = ordered_users(conn)
 
-    for uid, _, _ in users:
-        # always keep only 1 active packet per user
+    for uid, _, _, _ in users:
         expire_active_anomalies(conn, uid)
 
         if random.random() < 0.25:
