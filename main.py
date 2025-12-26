@@ -26,6 +26,11 @@ DB_PATH = os.environ.get("DB_PATH", "/var/data/nez.db")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
 
+# Duel settings
+DUEL_REQUEST_TTL_SEC = 10 * 60           # 10 minutes to accept/decline
+DUEL_COOLDOWN_MIN_SEC = 6 * 3600         # 6h
+DUEL_COOLDOWN_MAX_SEC = 12 * 3600        # 12h
+
 # ================== STYLE ==================
 def hdr():
     return "● NEZ PROJECT — EDEN-0 ACCESS\n"
@@ -55,6 +60,26 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id TEXT
     )""")
+
+    # Duel meta (cooldowns)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_meta (
+        user_id INTEGER PRIMARY KEY,
+        duel_cooldown_until INTEGER DEFAULT 0
+    )""")
+
+    # Duel requests
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS duels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        challenger_id INTEGER,
+        target_id INTEGER,
+        created_at INTEGER,
+        status TEXT,
+        winner_id INTEGER DEFAULT 0,
+        resolved_at INTEGER DEFAULT 0
+    )""")
+
     conn.commit()
     return conn
 
@@ -72,10 +97,11 @@ def create_user(conn, uid, name):
     )
     conn.commit()
 
-def add_points(conn, uid, pts):
+def add_points(conn, uid, pts_delta: int):
+    # clamp at 0 so index doesn't go negative
     conn.execute(
-        "UPDATE users SET points = points + ? WHERE user_id=?",
-        (pts, uid)
+        "UPDATE users SET points = CASE WHEN points + ? < 0 THEN 0 ELSE points + ? END WHERE user_id=?",
+        (pts_delta, pts_delta, uid)
     )
     conn.commit()
 
@@ -98,6 +124,42 @@ def queue_neighbors(conn, uid, window: int = 2):
     above = rows[max(0, i - window): i]
     below = rows[i + 1: i + 1 + window]
     return above, below
+
+def neighbor_above(conn, uid) -> Optional[Tuple[int, str, int]]:
+    rows = ordered_users(conn)
+    ids = [r[0] for r in rows]
+    if uid not in ids:
+        return None
+    i = ids.index(uid)
+    if i == 0:
+        return None
+    return rows[i - 1]  # (user_id, username, points)
+
+# ================== USER META (COOLDOWN) ==================
+def ensure_user_meta(conn, uid: int):
+    conn.execute(
+        "INSERT OR IGNORE INTO user_meta (user_id, duel_cooldown_until) VALUES (?, 0)",
+        (uid,)
+    )
+    conn.commit()
+
+def get_duel_cooldown_until(conn, uid: int) -> int:
+    ensure_user_meta(conn, uid)
+    row = conn.execute(
+        "SELECT duel_cooldown_until FROM user_meta WHERE user_id=?",
+        (uid,)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+def set_duel_cooldown(conn, uid: int):
+    ensure_user_meta(conn, uid)
+    now = int(time.time())
+    cd = random.randint(DUEL_COOLDOWN_MIN_SEC, DUEL_COOLDOWN_MAX_SEC)
+    conn.execute(
+        "UPDATE user_meta SET duel_cooldown_until=? WHERE user_id=?",
+        (now + cd, uid)
+    )
+    conn.commit()
 
 # ================== S AUDIO ==================
 def add_s_audio(conn, fid):
@@ -132,7 +194,7 @@ def get_active_anomaly(conn, uid):
     LIMIT 1
     """, (uid,)).fetchone()
 
-# NEW: always keep only 1 active packet per user
+# always keep only 1 active packet per user
 def expire_active_anomalies(conn, uid):
     conn.execute(
         "UPDATE anomalies SET status='EXPIRED' WHERE user_id=? AND status IN ('NEW','FIXED')",
@@ -158,6 +220,40 @@ def confirm_points(elapsed_sec: int) -> int:
         return 2
     return 1
 
+# ================== DUELS (Quota Shift) ==================
+def create_duel(conn, challenger_id: int, target_id: int) -> int:
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO duels (challenger_id, target_id, created_at, status) VALUES (?, ?, ?, 'PENDING')",
+        (challenger_id, target_id, now)
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+def get_duel(conn, duel_id: int):
+    return conn.execute(
+        "SELECT id, challenger_id, target_id, created_at, status, winner_id FROM duels WHERE id=?",
+        (duel_id,)
+    ).fetchone()
+
+def set_duel_status(conn, duel_id: int, status: str, winner_id: int = 0):
+    now = int(time.time())
+    conn.execute(
+        "UPDATE duels SET status=?, winner_id=?, resolved_at=? WHERE id=?",
+        (status, winner_id, now if status in ("DONE", "DECLINED", "EXPIRED") else 0, duel_id)
+    )
+    conn.commit()
+
+def mark_expired_if_ttl(conn, duel_row) -> bool:
+    # returns True if expired now
+    duel_id, challenger_id, target_id, created_at, status, winner_id = duel_row
+    if status != "PENDING":
+        return False
+    if int(time.time()) - int(created_at) > DUEL_REQUEST_TTL_SEC:
+        set_duel_status(conn, duel_id, "EXPIRED", 0)
+        return True
+    return False
+
 # ================== UI ==================
 def menu(uid):
     rows = [
@@ -170,6 +266,19 @@ def menu(uid):
         rows.append([InlineKeyboardButton("＋ Добавить S", callback_data="ADD_S")])
         rows.append([InlineKeyboardButton("⚠ Запустить пакет", callback_data="ADMIN_PUSH")])
     return InlineKeyboardMarkup(rows)
+
+def duel_request_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Запросить сдвиг квоты (сосед выше)", callback_data="DUEL_REQ")]
+    ])
+
+def duel_invite_kb(duel_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Принять", callback_data=f"DUEL_ACCEPT:{duel_id}"),
+            InlineKeyboardButton("Отклонить", callback_data=f"DUEL_DECLINE:{duel_id}")
+        ]
+    ])
 
 # ================== STATES ==================
 WAIT_USERNAME = set()
@@ -236,6 +345,136 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = q.from_user.id
     conn = db()
 
+    # ====== DUEL: request (quota shift) ======
+    if q.data == "DUEL_REQ":
+        # cooldown check
+        now = int(time.time())
+        until = get_duel_cooldown_until(conn, uid)
+        if now < until:
+            await q.edit_message_text(
+                "Окно пересчёта квоты недоступно. Повторите позже.",
+                reply_markup=menu(uid)
+            )
+            return
+
+        above = neighbor_above(conn, uid)
+        if not above:
+            await q.edit_message_text(
+                "Запрос невозможен: вышестоящий слот отсутствует.",
+                reply_markup=menu(uid)
+            )
+            return
+
+        target_id, target_name, _ = above
+        duel_id = create_duel(conn, uid, target_id)
+
+        # Put both on cooldown to prevent farming (request counted)
+        set_duel_cooldown(conn, uid)
+        set_duel_cooldown(conn, target_id)
+
+        # notify challenger
+        await q.edit_message_text(
+            "Запрос на сдвиг квоты сформирован.\n"
+            "Ожидание подтверждения адресата.",
+            reply_markup=menu(uid)
+        )
+
+        # send invite to target
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="Получен входящий запрос на сдвиг квоты.\n"
+                     "Участие добровольное.\n"
+                     "Подтвердите участие для запуска пересчёта.",
+                reply_markup=duel_invite_kb(duel_id)
+            )
+        except:
+            # if target can't be reached, expire request and notify challenger
+            set_duel_status(conn, duel_id, "EXPIRED", 0)
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text="Адресат недоступен. Пересчёт не выполнен."
+                )
+            except:
+                pass
+        return
+
+    # ====== DUEL: accept/decline ======
+    if q.data.startswith("DUEL_ACCEPT:") or q.data.startswith("DUEL_DECLINE:"):
+        action, duel_id_s = q.data.split(":")
+        duel_id = int(duel_id_s)
+
+        duel_row = get_duel(conn, duel_id)
+        if not duel_row:
+            await q.edit_message_text("Запрос недействителен.", reply_markup=menu(uid))
+            return
+
+        duel_id_db, challenger_id, target_id, created_at, status, winner_id = duel_row
+
+        # only target can respond
+        if uid != target_id:
+            await q.edit_message_text("Недостаточно прав доступа.", reply_markup=menu(uid))
+            return
+
+        # expire if too old
+        if mark_expired_if_ttl(conn, duel_row):
+            await q.edit_message_text("Запрос истёк. Пересчёт не выполнен.", reply_markup=menu(uid))
+            try:
+                await context.bot.send_message(
+                    chat_id=challenger_id,
+                    text="Запрос истёк. Пересчёт не выполнен."
+                )
+            except:
+                pass
+            return
+
+        if status != "PENDING":
+            await q.edit_message_text("Запрос уже обработан.", reply_markup=menu(uid))
+            return
+
+        if action == "DUEL_DECLINE":
+            set_duel_status(conn, duel_id, "DECLINED", 0)
+            await q.edit_message_text("Запрос отклонён. Пересчёт не выполнен.", reply_markup=menu(uid))
+            try:
+                await context.bot.send_message(
+                    chat_id=challenger_id,
+                    text="Запрос отклонён адресатом. Пересчёт не выполнен."
+                )
+            except:
+                pass
+            return
+
+        # ACCEPT: random resolution
+        # winner: either challenger or target
+        winner = challenger_id if random.random() < 0.5 else target_id
+        set_duel_status(conn, duel_id, "DONE", winner)
+
+        # rule: if invited wins -> invited +1, challenger -1; else opposite
+        if winner == target_id:
+            add_points(conn, target_id, +1)
+            add_points(conn, challenger_id, -1)
+        else:
+            add_points(conn, challenger_id, +1)
+            add_points(conn, target_id, -1)
+
+        await q.edit_message_text(
+            "Пересчёт квоты выполнен.\nРезультат: квота перераспределена.",
+            reply_markup=menu(uid)
+        )
+
+        # notify challenger
+        try:
+            await context.bot.send_message(
+                chat_id=challenger_id,
+                text="Пересчёт квоты выполнен.\nРезультат: квота перераспределена."
+            )
+        except:
+            pass
+
+        return
+
+    # ====== EXISTING FLOWS ======
     if q.data == "HELP":
         await q.edit_message_text(
             hdr() +
@@ -263,13 +502,16 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for r in below:
                     neigh += f"▼ {r[1]} — {r[2]}\n"
 
+        # Add duel button here (separate message UI) without changing existing text.
         await q.edit_message_text(
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
             f"Индекс допуска: {user[2]}"
             + neigh,
-            reply_markup=menu(uid)
+            reply_markup=InlineKeyboardMarkup(
+                (menu(uid).inline_keyboard + duel_request_kb().inline_keyboard)
+            )
         )
 
     elif q.data == "TOP":
