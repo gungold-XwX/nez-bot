@@ -27,7 +27,7 @@ DB_PATH = os.environ.get("DB_PATH", "/var/data/nez.db")
 
 # Scheduling
 TZ = ZoneInfo("Europe/Amsterdam")
-PACKETS_PER_DAY = 5
+PACKETS_PER_DAY = 3
 SCHEDULE_ANCHOR_HOUR = 0      # schedule daily shortly after midnight
 SCHEDULE_ANCHOR_MINUTE = 5
 
@@ -58,10 +58,11 @@ def db():
         created_at INTEGER,
         fixed_at INTEGER
     )""")
+    # file_id UNIQUE to avoid duplicates
     conn.execute("""
     CREATE TABLE IF NOT EXISTS s_audio (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_id TEXT
+        file_id TEXT UNIQUE
     )""")
     # store last day we scheduled random packet jobs (so restarts won't duplicate)
     conn.execute("""
@@ -126,9 +127,20 @@ def queue_neighbors(conn, uid, window: int = 2):
     return above, below
 
 # ================== S AUDIO ==================
-def add_s_audio(conn, fid):
-    conn.execute("INSERT INTO s_audio (file_id) VALUES (?)", (fid,))
-    conn.commit()
+def add_s_audio(conn, fid: str) -> bool:
+    """
+    Returns True if inserted, False if duplicate.
+    """
+    try:
+        conn.execute("INSERT INTO s_audio (file_id) VALUES (?)", (fid,))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def count_s_audio(conn) -> int:
+    row = conn.execute("SELECT COUNT(*) FROM s_audio").fetchone()
+    return int(row[0]) if row else 0
 
 def random_s_audio(conn) -> Optional[str]:
     row = conn.execute(
@@ -140,6 +152,19 @@ def random_s_audio(conn) -> Optional[str]:
 NOCLASS_TEXT = [
     "Пакет расшифрован: данные повреждены",
     "Пакет расшифрован: содержимое утеряно",
+]
+
+LORE_SNIPPETS = [
+    "01 — EVENT\n…мир пережил событие X, приведшее к необратимым изменениям глобального порядка…",
+    "02 — SCARCITY\n…ресурсов земли стало не хватать для обеспечения населения…",
+    "03 — DISASTER\n…усилились частота и масштаб природных катастроф…",
+    "04 — COLLAPSE\n…на фоне кризиса возникла фаза затяжных вооружённых конфликтов и анархии…",
+    "05 — INTERIM\n…после периода хаоса было сформировано временное правительство…",
+    "06 — STABILITY\n…глобально ситуация стабилизировалась на минимально допустимом уровне…",
+    "07 — NEZ\n…в рамках антикризисных мер была учреждена корпорация NEZ project…",
+    "08 — MISSION\n…основная задача: сбор, анализ и систематизация данных о феномене «нулевой эдем» и активности так называемого третьего измерения…",
+    "09 — EDEN\n…нулевой эдем — отдельное измерение, представляющее собой структурный двойник земли. доступ осуществляется через пространственно-временной разлом. изначально нулевой эдем рассматривался как «обнулённая» версия мира, потенциально пригодная для переселения человечества…",
+    "10 — QUEUE\n…согласно ранним данным, нулевой эдем являлся чистой, восстановленной формой земли. после определения даты стабильного открытия разлома NEZ project инициировал создание цифровой очереди для населения с целью контролируемого доступа в новое измерение…",
 ]
 
 def create_anomaly(conn, uid, kind, payload):
@@ -353,10 +378,16 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "ADD_S" and uid == ADMIN_ID:
         S_MODE.add(uid)
+        total_s = count_s_audio(conn)
         await q.edit_message_text(
             "Режим добавления S активен.\nОтправляйте аудио.",
             reply_markup=menu(uid)
         )
+        # не меняем UI-экран, но админ получит цифру отдельным сообщением
+        try:
+            await context.bot.send_message(uid, f"Всего S: {total_s}")
+        except:
+            pass
 
     elif q.data == "ADMIN_PUSH" and uid == ADMIN_ID:
         await spawn_anomalies(context)
@@ -370,9 +401,13 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fid = update.message.audio.file_id if update.message.audio else update.message.voice.file_id
     conn = db()
-    add_s_audio(conn, fid)
+    inserted = add_s_audio(conn, fid)
+    total_s = count_s_audio(conn)
 
-    await update.message.reply_text("S добавлен.")
+    if inserted:
+        await update.message.reply_text(f"S добавлен.\nВсего S: {total_s}")
+    else:
+        await update.message.reply_text(f"S уже существует.\nВсего S: {total_s}")
 
 # ================== SPAWN ==================
 async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
@@ -382,33 +417,35 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
     for uid, _, _ in users:
         expire_active_anomalies(conn, uid)
 
+        # 25% try S (if there is any S)
         if random.random() < 0.25:
             fid = random_s_audio(conn)
             if fid:
                 create_anomaly(conn, uid, "S", fid)
-                # still notify
                 try:
                     await context.bot.send_message(uid, "Новый пакет данных от NEZ Project доступен.")
                 except:
                     pass
                 continue
 
-        create_anomaly(conn, uid, "N", random.choice(NOCLASS_TEXT))
+        # Not S -> 50% NOCLASS, 50% LORE
+        if random.random() < 0.5:
+            payload = random.choice(NOCLASS_TEXT)
+        else:
+            payload = random.choice(LORE_SNIPPETS)
+
+        create_anomaly(conn, uid, "N", payload)
 
         try:
             await context.bot.send_message(uid, "Новый пакет данных от NEZ Project доступен.")
         except:
             pass
 
-# ================== AUTO SCHEDULING (5 random times/day) ==================
+# ================== AUTO SCHEDULING (3 random times/day) ==================
 def _today_key(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
 
 def _pick_random_times_for_date(date_local: datetime, n: int) -> list[datetime]:
-    """
-    Returns list of datetimes (local TZ) on the given date, with random times.
-    """
-    # random unique minutes in day
     minutes = random.sample(range(0, 24 * 60), k=n)
     minutes.sort()
     out = []
@@ -419,10 +456,6 @@ def _pick_random_times_for_date(date_local: datetime, n: int) -> list[datetime]:
     return out
 
 def schedule_packets_for_today(app: Application):
-    """
-    Schedule 5 run_once jobs today at random times (Amsterdam TZ).
-    Avoid duplicates after restarts by remembering date in DB.
-    """
     conn = db()
     now_local = datetime.now(TZ)
     key = _today_key(now_local)
@@ -431,18 +464,15 @@ def schedule_packets_for_today(app: Application):
     if last == key:
         return  # already scheduled today
 
-    # mark scheduled for today
     set_meta(conn, "last_scheduled_day", key)
 
     date_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     targets = _pick_random_times_for_date(date_local, PACKETS_PER_DAY)
 
     for i, target_local in enumerate(targets, 1):
-        # If time already passed, skip (won't send retroactively)
         delay = (target_local - now_local).total_seconds()
         if delay <= 0:
             continue
-
         app.job_queue.run_once(
             callback=spawn_anomalies,
             when=delay,
@@ -463,11 +493,9 @@ def seconds_until_next_anchor(now_local: datetime) -> float:
     return (anchor_next - now_local).total_seconds()
 
 async def daily_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
-    # called once per day (we schedule it ourselves after run)
     app = context.application
     schedule_packets_for_today(app)
 
-    # reschedule itself for next day anchor
     now_local = datetime.now(TZ)
     delay = seconds_until_next_anchor(now_local)
     app.job_queue.run_once(daily_scheduler_job, when=delay, name="daily_scheduler")
@@ -484,10 +512,10 @@ def build_app():
 if __name__ == "__main__":
     application = build_app()
 
-    # 1) schedule random packets for today immediately on boot (if not already)
+    # schedule packets for today on boot (if not already)
     schedule_packets_for_today(application)
 
-    # 2) schedule daily scheduler (runs every day ~00:05 Amsterdam)
+    # schedule daily scheduler (runs every day ~00:05 Amsterdam)
     now_local = datetime.now(TZ)
     first_delay = seconds_until_next_anchor(now_local)
     application.job_queue.run_once(daily_scheduler_job, when=first_delay, name="daily_scheduler")
