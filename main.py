@@ -28,7 +28,7 @@ DB_PATH = os.environ.get("DB_PATH", "/var/data/nez.db")
 # Scheduling
 TZ = ZoneInfo("Europe/Amsterdam")
 PACKETS_PER_DAY = 3
-SCHEDULE_ANCHOR_HOUR = 0      # schedule daily shortly after midnight
+SCHEDULE_ANCHOR_HOUR = 0
 SCHEDULE_ANCHOR_MINUTE = 5
 
 if not TOKEN:
@@ -41,6 +41,7 @@ def hdr():
 # ================== DB ==================
 def db():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
@@ -64,11 +65,27 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id TEXT UNIQUE
     )""")
-    # store last day we scheduled random packet jobs (so restarts won't duplicate)
+    # scheduler meta
     conn.execute("""
     CREATE TABLE IF NOT EXISTS scheduler_meta (
         k TEXT PRIMARY KEY,
         v TEXT
+    )""")
+    # username change requests
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS username_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        old_username TEXT,
+        new_username TEXT,
+        status TEXT,
+        created_at INTEGER
+    )""")
+    # per-user quota
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_limits (
+        user_id INTEGER PRIMARY KEY,
+        username_change_used INTEGER DEFAULT 0
     )""")
     conn.commit()
     return conn
@@ -96,6 +113,10 @@ def create_user(conn, uid, name):
     conn.execute(
         "INSERT INTO users VALUES (?, ?, 0, ?)",
         (uid, name, int(time.time()))
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO user_limits (user_id, username_change_used) VALUES (?, 0)",
+        (uid,)
     )
     conn.commit()
 
@@ -128,9 +149,6 @@ def queue_neighbors(conn, uid, window: int = 2):
 
 # ================== S AUDIO ==================
 def add_s_audio(conn, fid: str) -> bool:
-    """
-    Returns True if inserted, False if duplicate.
-    """
     try:
         conn.execute("INSERT INTO s_audio (file_id) VALUES (?)", (fid,))
         conn.commit()
@@ -183,7 +201,6 @@ def get_active_anomaly(conn, uid):
     LIMIT 1
     """, (uid,)).fetchone()
 
-# always keep only 1 active packet per user
 def expire_active_anomalies(conn, uid):
     conn.execute(
         "UPDATE anomalies SET status='EXPIRED' WHERE user_id=? AND status IN ('NEW','FIXED')",
@@ -209,23 +226,85 @@ def confirm_points(elapsed_sec: int) -> int:
         return 2
     return 1
 
+# ================== USERNAME CHANGE ==================
+# Registration ID stays strict (latin only)
+USERNAME_RE_REG = re.compile(r"^[a-zA-Z0-9_.-]{3,20}$")
+# Change request allows Cyrillic + spaces + digits + latin + _.- (no @)
+USERNAME_RE_CHANGE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9 _\.\-]{3,20}$")
+
+WAIT_USERNAME = set()
+WAIT_RENAME = set()
+S_MODE = set()
+
+def ensure_limits_row(conn, uid: int):
+    conn.execute(
+        "INSERT OR IGNORE INTO user_limits (user_id, username_change_used) VALUES (?, 0)",
+        (uid,)
+    )
+    conn.commit()
+
+def username_change_used(conn, uid: int) -> int:
+    ensure_limits_row(conn, uid)
+    row = conn.execute(
+        "SELECT username_change_used FROM user_limits WHERE user_id=?",
+        (uid,)
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+def inc_username_change_used(conn, uid: int):
+    ensure_limits_row(conn, uid)
+    conn.execute(
+        "UPDATE user_limits SET username_change_used = username_change_used + 1 WHERE user_id=?",
+        (uid,)
+    )
+    conn.commit()
+
+def create_rename_request(conn, uid: int, old_name: str, new_name: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO username_changes (user_id, old_username, new_username, status, created_at) "
+        "VALUES (?, ?, ?, 'PENDING', ?)",
+        (uid, old_name, new_name, int(time.time()))
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+def get_rename_request(conn, rid: int):
+    return conn.execute(
+        "SELECT id, user_id, old_username, new_username, status FROM username_changes WHERE id=?",
+        (rid,)
+    ).fetchone()
+
+def set_rename_status(conn, rid: int, status: str):
+    conn.execute("UPDATE username_changes SET status=? WHERE id=?", (status, rid))
+    conn.commit()
+
+def rename_kb(req_id: int):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Подтвердить", callback_data=f"RENAME_OK:{req_id}"),
+            InlineKeyboardButton("Отклонить", callback_data=f"RENAME_NO:{req_id}"),
+        ]
+    ])
+
 # ================== UI ==================
 def menu(uid):
-    rows = [
+    rows = []
+
+    # show cancel only when user is typing new ID
+    if uid in WAIT_RENAME:
+        rows.append([InlineKeyboardButton("Отмена", callback_data="RENAME_CANCEL")])
+
+    rows += [
         [InlineKeyboardButton("Позиция в очереди", callback_data="Q")],
         [InlineKeyboardButton("Активный пакет данных", callback_data="A")],
         [InlineKeyboardButton("Рейтинг", callback_data="TOP")],
         [InlineKeyboardButton("Помощь", callback_data="HELP")],
+        [InlineKeyboardButton("Смена ID", callback_data="RENAME")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton("＋ Добавить S", callback_data="ADD_S")])
         rows.append([InlineKeyboardButton("⚠ Запустить пакет", callback_data="ADMIN_PUSH")])
     return InlineKeyboardMarkup(rows)
-
-# ================== STATES ==================
-WAIT_USERNAME = set()
-S_MODE = set()
-USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,20}$")
 
 # ================== START ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,14 +334,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== TEXT ==================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    txt = (update.message.text or "").strip()
+    conn = db()
 
+    # registration ID (latin only)
     if uid in WAIT_USERNAME:
-        name = update.message.text.strip()
-        if not USERNAME_RE.match(name):
+        name = txt
+        if not USERNAME_RE_REG.match(name):
             await update.message.reply_text("Неверный формат. Попробуйте снова.")
             return
 
-        conn = db()
         if conn.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
             await update.message.reply_text("ID уже занят.")
             return
@@ -278,6 +359,62 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Позиция: {pos}/{total}",
             reply_markup=menu(uid)
         )
+        return
+
+    # rename flow
+    if uid in WAIT_RENAME:
+        user = get_user(conn, uid)
+        if not user:
+            WAIT_RENAME.discard(uid)
+            await update.message.reply_text("Вы еще не зарегистрированы.", reply_markup=menu(uid))
+            return
+
+        used = username_change_used(conn, uid)
+        if used >= 3:
+            WAIT_RENAME.discard(uid)
+            await update.message.reply_text("Лимит смены ID исчерпан.", reply_markup=menu(uid))
+            return
+
+        new_name = txt
+
+        if not USERNAME_RE_CHANGE.match(new_name):
+            await update.message.reply_text("Неверный формат. Попробуйте снова.")
+            return
+
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (new_name,)).fetchone():
+            await update.message.reply_text("ID уже занят.")
+            return
+
+        old_name = user[1]
+
+        # attempt counts on submission
+        inc_username_change_used(conn, uid)
+        used_after = username_change_used(conn, uid)
+
+        rid = create_rename_request(conn, uid, old_name, new_name)
+        WAIT_RENAME.discard(uid)
+
+        await update.message.reply_text(
+            "Запрос отправлен на проверку.",
+            reply_markup=menu(uid)
+        )
+
+        if ADMIN_ID != 0:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "Запрос на смену ID\n\n"
+                        f"Пользователь: {uid}\n"
+                        f"Текущий ID: {old_name}\n"
+                        f"Новый ID: {new_name}\n"
+                        f"Попытка: {used_after}/3"
+                    ),
+                    reply_markup=rename_kb(rid)
+                )
+            except:
+                pass
+        return
 
 # ================== CALLBACKS ==================
 async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,16 +502,87 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(uid, payload)
                     add_points(conn, uid, 2)
 
-                conn.execute(
-                    "UPDATE anomalies SET status='DONE' WHERE id=?",
-                    (aid,)
-                )
+                conn.execute("UPDATE anomalies SET status='DONE' WHERE id=?", (aid,))
                 conn.commit()
 
                 await q.edit_message_text(
                     "Пакет расшифрован.",
                     reply_markup=menu(uid)
                 )
+
+    elif q.data == "RENAME":
+        user = get_user(conn, uid)
+        if not user:
+            await q.edit_message_text("Вы еще не зарегистрированы.", reply_markup=menu(uid))
+            return
+
+        used = username_change_used(conn, uid)
+        if used >= 3:
+            await q.edit_message_text("Лимит смены ID исчерпан.", reply_markup=menu(uid))
+            return
+
+        left = 3 - used
+        WAIT_RENAME.add(uid)
+        await q.edit_message_text(
+            f"Введите новый ID.\nОсталось попыток: {left}/3",
+            reply_markup=menu(uid)
+        )
+
+    elif q.data == "RENAME_CANCEL":
+        if uid in WAIT_RENAME:
+            WAIT_RENAME.discard(uid)
+            await q.edit_message_text("Отменено.", reply_markup=menu(uid))
+        else:
+            await q.edit_message_text("Отменено.", reply_markup=menu(uid))
+
+    # admin moderation
+    elif q.data.startswith("RENAME_OK:") and uid == ADMIN_ID:
+        rid = int(q.data.split(":", 1)[1])
+        req = get_rename_request(conn, rid)
+        if not req:
+            await q.edit_message_text("Запрос не найден.", reply_markup=menu(uid))
+            return
+        _, target_uid, old_name, new_name, status = req
+        if status != "PENDING":
+            await q.edit_message_text("Запрос уже обработан.", reply_markup=menu(uid))
+            return
+
+        if conn.execute("SELECT 1 FROM users WHERE username=?", (new_name,)).fetchone():
+            set_rename_status(conn, rid, "DECLINED")
+            await q.edit_message_text("Отклонено: ID уже занят.", reply_markup=menu(uid))
+            try:
+                await context.bot.send_message(chat_id=target_uid, text="Запрос отклонён.")
+            except:
+                pass
+            return
+
+        conn.execute("UPDATE users SET username=? WHERE user_id=?", (new_name, target_uid))
+        conn.commit()
+        set_rename_status(conn, rid, "APPROVED")
+
+        await q.edit_message_text("Подтверждено.", reply_markup=menu(uid))
+        try:
+            await context.bot.send_message(chat_id=target_uid, text="Запрос подтвержден.")
+        except:
+            pass
+
+    elif q.data.startswith("RENAME_NO:") and uid == ADMIN_ID:
+        rid = int(q.data.split(":", 1)[1])
+        req = get_rename_request(conn, rid)
+        if not req:
+            await q.edit_message_text("Запрос не найден.", reply_markup=menu(uid))
+            return
+        _, target_uid, old_name, new_name, status = req
+        if status != "PENDING":
+            await q.edit_message_text("Запрос уже обработан.", reply_markup=menu(uid))
+            return
+
+        set_rename_status(conn, rid, "DECLINED")
+        await q.edit_message_text("Отклонено.", reply_markup=menu(uid))
+        try:
+            await context.bot.send_message(chat_id=target_uid, text="Запрос отклонён.")
+        except:
+            pass
 
     elif q.data == "ADD_S" and uid == ADMIN_ID:
         S_MODE.add(uid)
@@ -383,7 +591,6 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Режим добавления S активен.\nОтправляйте аудио.",
             reply_markup=menu(uid)
         )
-        # не меняем UI-экран, но админ получит цифру отдельным сообщением
         try:
             await context.bot.send_message(uid, f"Всего S: {total_s}")
         except:
@@ -417,7 +624,7 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
     for uid, _, _ in users:
         expire_active_anomalies(conn, uid)
 
-        # 25% try S (if there is any S)
+        # 25% try S
         if random.random() < 0.25:
             fid = random_s_audio(conn)
             if fid:
@@ -428,12 +635,7 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
                     pass
                 continue
 
-        # Not S -> 50% NOCLASS, 50% LORE
-        if random.random() < 0.5:
-            payload = random.choice(NOCLASS_TEXT)
-        else:
-            payload = random.choice(LORE_SNIPPETS)
-
+        payload = random.choice(NOCLASS_TEXT) if random.random() < 0.5 else random.choice(LORE_SNIPPETS)
         create_anomaly(conn, uid, "N", payload)
 
         try:
@@ -462,7 +664,7 @@ def schedule_packets_for_today(app: Application):
     last = get_meta(conn, "last_scheduled_day")
 
     if last == key:
-        return  # already scheduled today
+        return
 
     set_meta(conn, "last_scheduled_day", key)
 
@@ -488,7 +690,6 @@ def seconds_until_next_anchor(now_local: datetime) -> float:
     )
     if now_local < anchor_today:
         return (anchor_today - now_local).total_seconds()
-
     anchor_next = anchor_today + timedelta(days=1)
     return (anchor_next - now_local).total_seconds()
 
@@ -515,7 +716,7 @@ if __name__ == "__main__":
     # schedule packets for today on boot (if not already)
     schedule_packets_for_today(application)
 
-    # schedule daily scheduler (runs every day ~00:05 Amsterdam)
+    # schedule daily scheduler (~00:05 Amsterdam)
     now_local = datetime.now(TZ)
     first_delay = seconds_until_next_anchor(now_local)
     application.job_queue.run_once(daily_scheduler_job, when=first_delay, name="daily_scheduler")
