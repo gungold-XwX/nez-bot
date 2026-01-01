@@ -288,18 +288,18 @@ def rename_kb(req_id: int):
 
 # ================== UI ==================
 def menu(uid):
-    rows = []
-
-    # show cancel only when user is typing new ID
+    # режим смены ID: только отмена
     if uid in WAIT_RENAME:
-        rows.append([InlineKeyboardButton("Отмена", callback_data="RENAME_CANCEL")])
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Отмена", callback_data="RENAME_CANCEL")]
+        ])
 
-    rows += [
+    rows = [
         [InlineKeyboardButton("Позиция в очереди", callback_data="Q")],
         [InlineKeyboardButton("Активный пакет данных", callback_data="A")],
         [InlineKeyboardButton("Рейтинг", callback_data="TOP")],
-        [InlineKeyboardButton("Помощь", callback_data="HELP")],
         [InlineKeyboardButton("Смена ID", callback_data="RENAME")],
+        [InlineKeyboardButton("Помощь", callback_data="HELP")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton("＋ Добавить S", callback_data="ADD_S")])
@@ -531,9 +531,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data == "RENAME_CANCEL":
         if uid in WAIT_RENAME:
             WAIT_RENAME.discard(uid)
-            await q.edit_message_text("Отменено.", reply_markup=menu(uid))
-        else:
-            await q.edit_message_text("Отменено.", reply_markup=menu(uid))
+        await q.edit_message_text("Отменено.", reply_markup=menu(uid))
 
     # admin moderation
     elif q.data.startswith("RENAME_OK:") and uid == ADMIN_ID:
