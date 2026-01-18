@@ -38,6 +38,23 @@ if not TOKEN:
 def hdr():
     return "● NEZ PROJECT — EDEN-0 ACCESS\n"
 
+def access_level(points: int) -> str:
+    # Максимальный уровень: SSS если больше 500
+    if points > 500:
+        return "SSS"
+    # Ниже — ступени на усмотрение
+    if points >= 400:
+        return "SS"
+    if points >= 300:
+        return "A"
+    if points >= 200:
+        return "B"
+    if points >= 100:
+        return "C"
+    if points >= 50:
+        return "D"
+    return "E"
+
 # ================== DB ==================
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -185,6 +202,14 @@ LORE_SNIPPETS = [
     "Пакет расшифрован: Получен фрагмент №10 типа PROTOCOL — QUEUE\n…согласно ранним данным, нулевой эдем являлся чистой, восстановленной формой земли. после определения даты стабильного открытия разлома NEZ project инициировал создание цифровой очереди для населения с целью контролируемого доступа в новое измерение…",
 ]
 
+FRAGMENT_SNIPPETS = [
+    "Пакет расшифрован: Получен фрагмент №01 типа FRAGMENT\nЕщё один выстрел —\nв моей груди выцвел.\nЗнакомые лица…\nМне всё это просто снится...",
+    "Пакет расшифрован: Получен фрагмент №02 типа FRAGMENT\nОстанови меня\ngлазами своими синими.\nВ снега топи меня\nи к небесам возноси меня...",
+    "Пакет расшифрован: Получен фрагмент №03 типа FRAGMENT\nУ меня в запасе вечность.\nЕсли хочешь — стреляй, стреляй, стреляй.\nЕсли хочешь развлечься,\nесли хочешь огня, огня, огня...",
+    "Пакет расшифрован: Получен фрагмент №04 типа FRAGMENT\nТы так слаба на вид, но\nвсе твои шрамы видно.\nИ ты впиваешься в шею —\nмоя Фемида...",
+    "Пакет расшифрован: Получен фрагмент №05 типа FRAGMENT\nНочью под белым пламенем\nлежим убиты, ранены.\nПоцелуй на прощание —\nтвои слёзы — моя вина...",
+]
+
 def create_anomaly(conn, uid, kind, payload):
     conn.execute("""
     INSERT INTO anomalies (user_id, kind, payload, status, created_at)
@@ -318,7 +343,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска: {user[2]}",
+            f"Индекс допуска: {user[2]}\n"
+            f"Уровень доступа: {access_level(int(user[2]))}",
             reply_markup=menu(uid)
         )
         return
@@ -454,7 +480,8 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска: {user[2]}"
+            f"Индекс допуска: {user[2]}\n"
+            f"Уровень доступа: {access_level(int(user[2]))}"
             + neigh,
             reply_markup=menu(uid)
         )
@@ -496,6 +523,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("Происходит расшифровка пакета данных… Пожалуйста, подождите.", reply_markup=menu(uid))
             else:
                 if kind == "S":
+                    await context.bot.send_message(uid, "Пакет расшифрован: Получен фрагмент типа INTERCEPT")
                     await context.bot.send_audio(uid, payload)
                     add_points(conn, uid, 4)
                 else:
@@ -633,7 +661,14 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
                     pass
                 continue
 
-        payload = random.choice(NOCLASS_TEXT) if random.random() < 0.5 else random.choice(LORE_SNIPPETS)
+        r = random.random()
+        if r < 0.5:
+            payload = random.choice(NOCLASS_TEXT)
+        elif r < 0.75:
+            payload = random.choice(LORE_SNIPPETS)
+        else:
+            payload = random.choice(FRAGMENT_SNIPPETS)
+
         create_anomaly(conn, uid, "N", payload)
 
         try:
