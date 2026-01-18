@@ -650,8 +650,10 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
     for uid, _, _ in users:
         expire_active_anomalies(conn, uid)
 
-        # 25% try S
-        if random.random() < 0.25:
+        r = random.random()
+
+        # 40% шанс попытаться выдать S (аудио)
+        if r < 0.40:
             fid = random_s_audio(conn)
             if fid:
                 create_anomaly(conn, uid, "S", fid)
@@ -660,14 +662,16 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
                 except:
                     pass
                 continue
+            # если аудио нет (пустая база) — падаем в текстовую выдачу ниже
 
-        r = random.random()
-        if r < 0.5:
-            payload = random.choice(NOCLASS_TEXT)
-        elif r < 0.75:
+        # Текстовые пакеты: 20% FRAGMENT, 20% LORE, 20% NOCLASS
+        # (а если аудио не существует, то по факту будет 1/3 на каждый тип текста)
+        if r < 0.60:
+            payload = random.choice(FRAGMENT_SNIPPETS)
+        elif r < 0.80:
             payload = random.choice(LORE_SNIPPETS)
         else:
-            payload = random.choice(FRAGMENT_SNIPPETS)
+            payload = random.choice(NOCLASS_TEXT)
 
         create_anomaly(conn, uid, "N", payload)
 
