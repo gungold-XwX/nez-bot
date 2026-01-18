@@ -3,6 +3,7 @@ import sqlite3
 import random
 import time
 import re
+import math
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -30,6 +31,9 @@ TZ = ZoneInfo("Europe/Amsterdam")
 PACKETS_PER_DAY = 3
 SCHEDULE_ANCHOR_HOUR = 0
 SCHEDULE_ANCHOR_MINUTE = 5
+
+# Activity ranking (decay)
+ACTIVITY_HALF_LIFE_DAYS = 7  # активность “вдвое” тухнет за 7 дней
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
@@ -104,6 +108,13 @@ def db():
         user_id INTEGER PRIMARY KEY,
         username_change_used INTEGER DEFAULT 0
     )""")
+    # activity score (decaying)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_activity (
+        user_id INTEGER PRIMARY KEY,
+        score REAL DEFAULT 0,
+        updated_at INTEGER
+    )""")
     conn.commit()
     return conn
 
@@ -116,6 +127,42 @@ def set_meta(conn, key: str, value: str):
         "INSERT INTO scheduler_meta (k, v) VALUES (?, ?) "
         "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
         (key, value)
+    )
+    conn.commit()
+
+# ================== ACTIVITY ==================
+def ensure_activity_row(conn, uid: int):
+    conn.execute(
+        "INSERT OR IGNORE INTO user_activity (user_id, score, updated_at) VALUES (?, 0, ?)",
+        (uid, int(time.time()))
+    )
+    conn.commit()
+
+def get_activity(conn, uid: int) -> Tuple[float, int]:
+    ensure_activity_row(conn, uid)
+    row = conn.execute(
+        "SELECT score, updated_at FROM user_activity WHERE user_id=?",
+        (uid,)
+    ).fetchone()
+    if not row:
+        return 0.0, int(time.time())
+    return float(row[0] or 0.0), int(row[1] or int(time.time()))
+
+def update_activity(conn, uid: int, pts: int, now_ts: int):
+    score, last_ts = get_activity(conn, uid)
+    dt = max(0, now_ts - last_ts)
+
+    half_life_sec = ACTIVITY_HALF_LIFE_DAYS * 24 * 3600
+    if half_life_sec <= 0:
+        decay = 0.0
+    else:
+        decay = 0.5 ** (dt / half_life_sec)
+
+    new_score = score * decay + float(pts)
+
+    conn.execute(
+        "UPDATE user_activity SET score=?, updated_at=? WHERE user_id=?",
+        (new_score, now_ts, uid)
     )
     conn.commit()
 
@@ -135,19 +182,54 @@ def create_user(conn, uid, name):
         "INSERT OR IGNORE INTO user_limits (user_id, username_change_used) VALUES (?, 0)",
         (uid,)
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO user_activity (user_id, score, updated_at) VALUES (?, 0, ?)",
+        (uid, int(time.time()))
+    )
     conn.commit()
 
 def add_points(conn, uid, pts):
+    now_ts = int(time.time())
     conn.execute(
         "UPDATE users SET points = points + ? WHERE user_id=?",
         (pts, uid)
     )
     conn.commit()
+    update_activity(conn, uid, pts, now_ts)
 
 def ordered_users(conn):
-    return conn.execute(
-        "SELECT user_id, username, points FROM users ORDER BY points DESC, created_at ASC"
-    ).fetchall()
+    rows = conn.execute("""
+        SELECT u.user_id, u.username, u.points, u.created_at,
+               COALESCE(a.score, 0) AS activity_score
+        FROM users u
+        LEFT JOIN user_activity a ON a.user_id = u.user_id
+    """).fetchall()
+
+    if not rows:
+        return []
+
+    points_logs = [math.log1p(max(0, int(r[2]))) for r in rows]
+    act_logs = [math.log1p(max(0.0, float(r[4] or 0.0))) for r in rows]
+
+    max_p = max(points_logs) if points_logs else 1.0
+    max_a = max(act_logs) if act_logs else 1.0
+
+    if max_p <= 0:
+        max_p = 1.0
+    if max_a <= 0:
+        max_a = 1.0
+
+    scored = []
+    for r in rows:
+        uid, username, points, created_at, a_score = r
+        p_norm = math.log1p(max(0, int(points))) / max_p
+        a_norm = math.log1p(max(0.0, float(a_score or 0.0))) / max_a
+        blended = 0.5 * p_norm + 0.5 * a_norm
+        scored.append((uid, username, int(points), int(created_at), blended))
+
+    scored.sort(key=lambda x: (-x[4], -x[2], x[3]))
+
+    return [(s[0], s[1], s[2]) for s in scored]
 
 def queue_position(conn, uid) -> Tuple[int, int]:
     ids = [r[0] for r in ordered_users(conn)]
