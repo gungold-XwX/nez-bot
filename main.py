@@ -465,9 +465,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска — ACC: {user[2]}\n"
-            f"Индекс синхронизации — SYNC: {int(round(sync_now))}\n"
-            f"Приоритет доступа — PRI: {pri}\n"
+            f"Индекс допуска (ACC): {user[2]}\n"
+            f"Индекс синхронизации (SYNC): {int(round(sync_now))}\n"
+            f"Приоритет доступа (PRI): {pri}\n"
             f"Уровень доступа: {access_level(int(user[2]))}",
             reply_markup=menu(uid)
         )
@@ -580,7 +580,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Несколько раз за день NEZ Project отправляет на ваш терминал пакеты данных\n"
             "• Подтверждение и расшифровка пакетов данных повышают ваш индекс допуска\n"
             "• Чем быстрее вы подтвердите и расшифруете присланный пакет данных, тем сильнее повысится ваш индекс допуска\n"
-            "• Чем выше ваши индекс допуска и активность внутри бота — тем выше ваша позиция в очереди\n"
+            "• Чем выше ваши индекс допуска (ACC) и активность (SYNC) внутри бота — тем выше ваши приоритет доступа (PRI) и позиция в очереди\n"
             "• Обладатели первых трех позиций в очереди будут отмечены публично на специальной конференции NEZ Project 24.01.26. metaego-asterasounds2401.ticketscloud.org",
             reply_markup=menu(uid)
         )
