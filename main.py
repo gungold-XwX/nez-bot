@@ -33,7 +33,7 @@ SCHEDULE_ANCHOR_HOUR = 0
 SCHEDULE_ANCHOR_MINUTE = 5
 
 # Activity ranking (decay)
-ACTIVITY_HALF_LIFE_DAYS = 7  # активность “вдвое” тухнет за 7 дней
+ACTIVITY_HALF_LIFE_DAYS = 3  # активность “вдвое” тухнет за 3 дня
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN not set")
@@ -148,16 +148,25 @@ def get_activity(conn, uid: int) -> Tuple[float, int]:
         return 0.0, int(time.time())
     return float(row[0] or 0.0), int(row[1] or int(time.time()))
 
+def _decay_multiplier(dt_sec: int) -> float:
+    half_life_sec = ACTIVITY_HALF_LIFE_DAYS * 24 * 3600
+    if half_life_sec <= 0:
+        return 0.0
+    return 0.5 ** (dt_sec / half_life_sec)
+
+def get_sync_now(conn, uid: int, now_ts: Optional[int] = None) -> float:
+    if now_ts is None:
+        now_ts = int(time.time())
+    score, last_ts = get_activity(conn, uid)
+    dt = max(0, now_ts - last_ts)
+    decay = _decay_multiplier(dt)
+    return float(score) * decay
+
 def update_activity(conn, uid: int, pts: int, now_ts: int):
     score, last_ts = get_activity(conn, uid)
     dt = max(0, now_ts - last_ts)
 
-    half_life_sec = ACTIVITY_HALF_LIFE_DAYS * 24 * 3600
-    if half_life_sec <= 0:
-        decay = 0.0
-    else:
-        decay = 0.5 ** (dt / half_life_sec)
-
+    decay = _decay_multiplier(dt)
     new_score = score * decay + float(pts)
 
     conn.execute(
@@ -198,18 +207,30 @@ def add_points(conn, uid, pts):
     update_activity(conn, uid, pts, now_ts)
 
 def ordered_users(conn):
+    now_ts = int(time.time())
+
     rows = conn.execute("""
         SELECT u.user_id, u.username, u.points, u.created_at,
-               COALESCE(a.score, 0) AS activity_score
+               COALESCE(a.score, 0) AS activity_score,
+               COALESCE(a.updated_at, ?) AS activity_updated_at
         FROM users u
         LEFT JOIN user_activity a ON a.user_id = u.user_id
-    """).fetchall()
+    """, (now_ts,)).fetchall()
 
     if not rows:
         return []
 
+    # effective (decayed-to-now) SYNC
+    eff_sync = []
+    for r in rows:
+        score = float(r[4] or 0.0)
+        last_ts = int(r[5] or now_ts)
+        dt = max(0, now_ts - last_ts)
+        decay = _decay_multiplier(dt)
+        eff_sync.append(score * decay)
+
     points_logs = [math.log1p(max(0, int(r[2]))) for r in rows]
-    act_logs = [math.log1p(max(0.0, float(r[4] or 0.0))) for r in rows]
+    act_logs = [math.log1p(max(0.0, float(s))) for s in eff_sync]
 
     max_p = max(points_logs) if points_logs else 1.0
     max_a = max(act_logs) if act_logs else 1.0
@@ -220,16 +241,32 @@ def ordered_users(conn):
         max_a = 1.0
 
     scored = []
-    for r in rows:
-        uid, username, points, created_at, a_score = r
+    for idx, r in enumerate(rows):
+        uid, username, points, created_at, _, _ = r
+        sync_now = float(eff_sync[idx])
+
         p_norm = math.log1p(max(0, int(points))) / max_p
-        a_norm = math.log1p(max(0.0, float(a_score or 0.0))) / max_a
+        a_norm = math.log1p(max(0.0, sync_now)) / max_a
+
         blended = 0.5 * p_norm + 0.5 * a_norm
-        scored.append((uid, username, int(points), int(created_at), blended))
 
-    scored.sort(key=lambda x: (-x[4], -x[2], x[3]))
+        # PRI as readable integer scale
+        pri_int = int(round(blended * 1000))
 
-    return [(s[0], s[1], s[2]) for s in scored]
+        scored.append((uid, username, int(points), int(created_at), sync_now, blended, pri_int))
+
+    # sort by PRI (blended), then by ACC(points), then by created_at
+    scored.sort(key=lambda x: (-x[5], -x[2], x[3]))
+
+    # Return (uid, username, PRI) for TOP / neighbors / queue list
+    return [(s[0], s[1], s[6]) for s in scored]
+
+def pri_of_user(conn, uid: int) -> int:
+    rows = ordered_users(conn)
+    for r in rows:
+        if r[0] == uid:
+            return int(r[2])
+    return 0
 
 def queue_position(conn, uid) -> Tuple[int, int]:
     ids = [r[0] for r in ordered_users(conn)]
@@ -237,7 +274,7 @@ def queue_position(conn, uid) -> Tuple[int, int]:
     return (ids.index(uid) + 1, total) if uid in ids else (total + 1, total)
 
 def queue_neighbors(conn, uid, window: int = 2):
-    rows = ordered_users(conn)  # (user_id, username, points)
+    rows = ordered_users(conn)  # (user_id, username, pri)
     ids = [r[0] for r in rows]
     if uid not in ids:
         return [], []
@@ -421,11 +458,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user:
         pos, total = queue_position(conn, uid)
+        sync_now = get_sync_now(conn, uid)
+        pri = pri_of_user(conn, uid)
+
         await update.message.reply_text(
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска: {user[2]}\n"
+            f"Индекс допуска — ACC: {user[2]}\n"
+            f"Индекс синхронизации — SYNC: {int(round(sync_now))}\n"
+            f"Приоритет доступа — PRI: {pri}\n"
             f"Уровень доступа: {access_level(int(user[2]))}",
             reply_markup=menu(uid)
         )
@@ -547,6 +589,9 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = get_user(conn, uid)
         pos, total = queue_position(conn, uid)
 
+        sync_now = get_sync_now(conn, uid)
+        pri = pri_of_user(conn, uid)
+
         above, below = queue_neighbors(conn, uid, window=2)
         neigh = ""
         if above or below:
@@ -562,7 +607,9 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска: {user[2]}\n"
+            f"Индекс допуска — ACC: {user[2]}\n"
+            f"Индекс синхронизации — SYNC: {int(round(sync_now))}\n"
+            f"Приоритет доступа — PRI: {pri}\n"
             f"Уровень доступа: {access_level(int(user[2]))}"
             + neigh,
             reply_markup=menu(uid)
