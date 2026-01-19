@@ -605,9 +605,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hdr() +
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
-            f"Индекс допуска — ACC: {user[2]}\n"
-            f"Индекс синхронизации — SYNC: {int(round(sync_now))}\n"
-            f"Приоритет доступа — PRI: {pri}\n"
+            f"Индекс допуска: {pri}\n"
             f"Уровень доступа: {access_level(int(user[2]))}"
             + neigh,
             reply_markup=menu(uid)
