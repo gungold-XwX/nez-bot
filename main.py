@@ -43,10 +43,8 @@ def hdr():
     return "● NEZ PROJECT — EDEN-0 ACCESS\n"
 
 def access_level(points: int) -> str:
-    # Максимальный уровень: SSS если больше 500
     if points > 500:
         return "SSS"
-    # Ниже — ступени на усмотрение
     if points >= 400:
         return "SS"
     if points >= 300:
@@ -80,19 +78,16 @@ def db():
         created_at INTEGER,
         fixed_at INTEGER
     )""")
-    # file_id UNIQUE to avoid duplicates
     conn.execute("""
     CREATE TABLE IF NOT EXISTS s_audio (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id TEXT UNIQUE
     )""")
-    # scheduler meta
     conn.execute("""
     CREATE TABLE IF NOT EXISTS scheduler_meta (
         k TEXT PRIMARY KEY,
         v TEXT
     )""")
-    # username change requests
     conn.execute("""
     CREATE TABLE IF NOT EXISTS username_changes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,13 +97,11 @@ def db():
         status TEXT,
         created_at INTEGER
     )""")
-    # per-user quota
     conn.execute("""
     CREATE TABLE IF NOT EXISTS user_limits (
         user_id INTEGER PRIMARY KEY,
         username_change_used INTEGER DEFAULT 0
     )""")
-    # activity score (decaying)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS user_activity (
         user_id INTEGER PRIMARY KEY,
@@ -129,6 +122,42 @@ def set_meta(conn, key: str, value: str):
         (key, value)
     )
     conn.commit()
+
+# ================== FREEZE (QUEUE LOCK) ==================
+FREEZE_KEY = "queue_frozen"          # "1" / "0"
+FREEZE_TS_KEY = "queue_frozen_ts"    # unix ts
+
+def is_frozen(conn) -> Tuple[bool, Optional[int]]:
+    v = get_meta(conn, FREEZE_KEY)
+    if v == "1":
+        ts = get_meta(conn, FREEZE_TS_KEY)
+        try:
+            return True, int(ts) if ts else None
+        except:
+            return True, None
+    return False, None
+
+def set_frozen(conn, frozen: bool):
+    if frozen:
+        set_meta(conn, FREEZE_KEY, "1")
+        set_meta(conn, FREEZE_TS_KEY, str(int(time.time())))
+    else:
+        set_meta(conn, FREEZE_KEY, "0")
+        set_meta(conn, FREEZE_TS_KEY, "")
+
+def freeze_banner(conn) -> str:
+    frozen, ts = is_frozen(conn)
+    if not frozen:
+        return ""
+    stamp = ""
+    if ts:
+        try:
+            stamp = datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M:%S %Z")
+        except:
+            stamp = ""
+    if stamp:
+        return f"\n\n[СТАТУС] ОЧЕРЕДЬ ЗАМОРОЖЕНА\nФиксация: {stamp}"
+    return "\n\n[СТАТУС] ОЧЕРЕДЬ ЗАМОРОЖЕНА"
 
 # ================== ACTIVITY ==================
 def ensure_activity_row(conn, uid: int):
@@ -198,6 +227,10 @@ def create_user(conn, uid, name):
     conn.commit()
 
 def add_points(conn, uid, pts):
+    frozen, _ = is_frozen(conn)
+    if frozen:
+        return  # заморозка: никаких изменений очков/активности
+
     now_ts = int(time.time())
     conn.execute(
         "UPDATE users SET points = points + ? WHERE user_id=?",
@@ -207,7 +240,9 @@ def add_points(conn, uid, pts):
     update_activity(conn, uid, pts, now_ts)
 
 def ordered_users(conn):
-    now_ts = int(time.time())
+    # если заморожено — фиксируем "сейчас" на момент фиксации
+    frozen, fts = is_frozen(conn)
+    now_ts = int(fts) if (frozen and fts) else int(time.time())
 
     rows = conn.execute("""
         SELECT u.user_id, u.username, u.points, u.created_at,
@@ -220,7 +255,6 @@ def ordered_users(conn):
     if not rows:
         return []
 
-    # effective (decayed-to-now) SYNC
     eff_sync = []
     for r in rows:
         score = float(r[4] or 0.0)
@@ -250,15 +284,10 @@ def ordered_users(conn):
 
         blended = 0.5 * p_norm + 0.5 * a_norm
 
-        # PRI as readable integer scale
         pri_int = int(round(blended * 1000))
-
         scored.append((uid, username, int(points), int(created_at), sync_now, blended, pri_int))
 
-    # sort by PRI (blended), then by ACC(points), then by created_at
     scored.sort(key=lambda x: (-x[5], -x[2], x[3]))
-
-    # Return (uid, username, PRI) for TOP / neighbors / queue list
     return [(s[0], s[1], s[6]) for s in scored]
 
 def pri_of_user(conn, uid: int) -> int:
@@ -274,7 +303,7 @@ def queue_position(conn, uid) -> Tuple[int, int]:
     return (ids.index(uid) + 1, total) if uid in ids else (total + 1, total)
 
 def queue_neighbors(conn, uid, window: int = 2):
-    rows = ordered_users(conn)  # (user_id, username, pri)
+    rows = ordered_users(conn)
     ids = [r[0] for r in rows]
     if uid not in ids:
         return [], []
@@ -371,13 +400,12 @@ def confirm_points(elapsed_sec: int) -> int:
     return 1
 
 # ================== USERNAME CHANGE ==================
-# Registration ID stays strict (latin only)
 USERNAME_RE_REG = re.compile(r"^[a-zA-Z0-9_.-]{3,20}$")
-# Change request allows Cyrillic + spaces + digits + latin + _.- (no @)
 USERNAME_RE_CHANGE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9 _\.\-]{3,20}$")
 
 WAIT_USERNAME = set()
 WAIT_RENAME = set()
+WAIT_BROADCAST = set()
 S_MODE = set()
 
 def ensure_limits_row(conn, uid: int):
@@ -432,10 +460,14 @@ def rename_kb(req_id: int):
 
 # ================== UI ==================
 def menu(uid):
-    # режим смены ID: только отмена
     if uid in WAIT_RENAME:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("Отмена", callback_data="RENAME_CANCEL")]
+        ])
+
+    if uid in WAIT_BROADCAST and uid == ADMIN_ID:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Отмена", callback_data="ADMIN_BROADCAST_CANCEL")]
         ])
 
     rows = [
@@ -446,6 +478,8 @@ def menu(uid):
         [InlineKeyboardButton("Помощь", callback_data="HELP")],
     ]
     if uid == ADMIN_ID:
+        rows.append([InlineKeyboardButton("📣 Рассылка", callback_data="ADMIN_BROADCAST")])
+        rows.append([InlineKeyboardButton("🧊 Заморозка очереди", callback_data="ADMIN_FREEZE_TOGGLE")])
         rows.append([InlineKeyboardButton("＋ Добавить S", callback_data="ADD_S")])
         rows.append([InlineKeyboardButton("⚠ Запустить пакет", callback_data="ADMIN_PUSH")])
     return InlineKeyboardMarkup(rows)
@@ -458,7 +492,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user:
         pos, total = queue_position(conn, uid)
-        sync_now = get_sync_now(conn, uid)
         pri = pri_of_user(conn, uid)
 
         await update.message.reply_text(
@@ -466,7 +499,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ID: {user[1]}\n"
             f"Позиция: {pos}/{total}\n"
             f"Индекс допуска: {pri}\n"
-            f"Уровень доступа: {access_level(int(user[2]))}",
+            f"Уровень доступа: {access_level(int(user[2]))}"
+            + freeze_banner(conn),
             reply_markup=menu(uid)
         )
         return
@@ -485,7 +519,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     conn = db()
 
-    # registration ID (latin only)
+    # ===== admin broadcast flow =====
+    if uid == ADMIN_ID and uid in WAIT_BROADCAST:
+        WAIT_BROADCAST.discard(uid)
+
+        rows = conn.execute("SELECT user_id FROM users").fetchall()
+        user_ids = [int(r[0]) for r in rows]
+
+        sent = 0
+        failed = 0
+
+        for to_uid in user_ids:
+            try:
+                await context.bot.send_message(chat_id=to_uid, text=txt)
+                sent += 1
+            except:
+                failed += 1
+
+        await update.message.reply_text(
+            f"Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}",
+            reply_markup=menu(uid)
+        )
+        return
+
+    # ===== registration ID (latin only) =====
     if uid in WAIT_USERNAME:
         name = txt
         if not USERNAME_RE_REG.match(name):
@@ -504,12 +561,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hdr() +
             f"Доступ активирован.\n"
             f"ID: {name}\n"
-            f"Позиция: {pos}/{total}",
+            f"Позиция: {pos}/{total}"
+            + freeze_banner(conn),
             reply_markup=menu(uid)
         )
         return
 
-    # rename flow
+    # ===== rename flow (allowed even in freeze) =====
     if uid in WAIT_RENAME:
         user = get_user(conn, uid)
         if not user:
@@ -534,8 +592,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         old_name = user[1]
-
-        # attempt counts on submission
         inc_username_change_used(conn, uid)
         used_after = username_change_used(conn, uid)
 
@@ -579,15 +635,15 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Подтверждение и расшифровка пакетов данных повышают ваш индекс допуска\n"
             "• Чем быстрее вы подтвердите и расшифруете присланный пакет данных, тем сильнее повысится ваш индекс допуска\n"
             "• Чем выше индекс допуска — тем выше ваша позиция в очереди\n"
-            "• Обладатели первых трех позиций в очереди будут отмечены публично на специальной конференции NEZ Project 24.01.26. metaego-asterasounds2401.ticketscloud.org",
+            "• Обладатели первых трех позиций в очереди будут отмечены публично на специальной конференции NEZ Project 24.01.26.\n"
+            "metaego-asterasounds2401.ticketscloud.org"
+            + freeze_banner(conn),
             reply_markup=menu(uid)
         )
 
     elif q.data == "Q":
         user = get_user(conn, uid)
         pos, total = queue_position(conn, uid)
-
-        sync_now = get_sync_now(conn, uid)
         pri = pri_of_user(conn, uid)
 
         above, below = queue_neighbors(conn, uid, window=2)
@@ -607,7 +663,8 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Позиция: {pos}/{total}\n"
             f"Индекс допуска: {pri}\n"
             f"Уровень доступа: {access_level(int(user[2]))}"
-            + neigh,
+            + neigh
+            + freeze_banner(conn),
             reply_markup=menu(uid)
         )
 
@@ -616,9 +673,22 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = hdr() + "Обладатели первых позиций в очереди:\n\n"
         for i, r in enumerate(rows, 1):
             text += f"{i}. {r[1]} — {r[2]}\n"
+        text += freeze_banner(conn)
         await q.edit_message_text(text, reply_markup=menu(uid))
 
     elif q.data == "A":
+        frozen, _ = is_frozen(conn)
+        if frozen:
+            await q.edit_message_text(
+                hdr() +
+                "Очередь переведена в режим фиксации.\n"
+                "Выдача и обработка пакетов данных временно приостановлены.\n\n"
+                "Подробности будут опубликованы дополнительно."
+                + freeze_banner(conn),
+                reply_markup=menu(uid)
+            )
+            return
+
         a = get_active_anomaly(conn, uid)
         if not a:
             await q.edit_message_text("Вы еще не получили новый пакет данных от NEZ Project.", reply_markup=menu(uid))
@@ -686,7 +756,45 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WAIT_RENAME.discard(uid)
         await q.edit_message_text("Отменено.", reply_markup=menu(uid))
 
-    # admin moderation
+    # ================== ADMIN: BROADCAST ==================
+    elif q.data == "ADMIN_BROADCAST" and uid == ADMIN_ID:
+        WAIT_BROADCAST.add(uid)
+        await q.edit_message_text(
+            hdr() +
+            "Режим рассылки активирован.\n\n"
+            "Отправьте одним сообщением текст, который необходимо разослать всем пользователям.\n"
+            "Для отмены нажмите «Отмена».",
+            reply_markup=menu(uid)
+        )
+
+    elif q.data == "ADMIN_BROADCAST_CANCEL" and uid == ADMIN_ID:
+        WAIT_BROADCAST.discard(uid)
+        await q.edit_message_text("Отменено.", reply_markup=menu(uid))
+
+    # ================== ADMIN: FREEZE TOGGLE ==================
+    elif q.data == "ADMIN_FREEZE_TOGGLE" and uid == ADMIN_ID:
+        frozen, _ = is_frozen(conn)
+        set_frozen(conn, not frozen)
+
+        frozen2, ts2 = is_frozen(conn)
+        if frozen2:
+            stamp = datetime.fromtimestamp(ts2 or int(time.time()), TZ).strftime("%d.%m.%Y %H:%M:%S %Z")
+            msg = (
+                hdr() +
+                "Очередь переведена в режим фиксации.\n"
+                f"Время фиксации: {stamp}\n\n"
+                "Выдача пакетов данных, перерасчет рейтингов и начисления приостановлены."
+            )
+        else:
+            msg = (
+                hdr() +
+                "Режим фиксации отключён.\n\n"
+                "Очередь, выдача пакетов и начисления возобновлены."
+            )
+
+        await q.edit_message_text(msg, reply_markup=menu(uid))
+
+    # ================== ADMIN MODERATION (RENAME) ==================
     elif q.data.startswith("RENAME_OK:") and uid == ADMIN_ID:
         rid = int(q.data.split(":", 1)[1])
         req = get_rename_request(conn, rid)
@@ -735,6 +843,7 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
+    # ================== ADMIN: S AUDIO ==================
     elif q.data == "ADD_S" and uid == ADMIN_ID:
         S_MODE.add(uid)
         total_s = count_s_audio(conn)
@@ -748,6 +857,10 @@ async def on_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     elif q.data == "ADMIN_PUSH" and uid == ADMIN_ID:
+        frozen, _ = is_frozen(conn)
+        if frozen:
+            await q.edit_message_text("Очередь заморожена. Выдача пакетов приостановлена.", reply_markup=menu(uid))
+            return
         await spawn_anomalies(context)
         await q.edit_message_text("Пакеты отправлены.", reply_markup=menu(uid))
 
@@ -770,6 +883,11 @@ async def on_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================== SPAWN ==================
 async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
     conn = db()
+
+    frozen, _ = is_frozen(conn)
+    if frozen:
+        return  # заморозка: пакеты не выдаём
+
     users = ordered_users(conn)
 
     for uid, _, _ in users:
@@ -777,7 +895,6 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
 
         r = random.random()
 
-        # 40% шанс попытаться выдать S (аудио)
         if r < 0.40:
             fid = random_s_audio(conn)
             if fid:
@@ -787,10 +904,7 @@ async def spawn_anomalies(context: ContextTypes.DEFAULT_TYPE):
                 except:
                     pass
                 continue
-            # если аудио нет (пустая база) — падаем в текстовую выдачу ниже
 
-        # Текстовые пакеты: 20% FRAGMENT, 20% LORE, 20% NOCLASS
-        # (а если аудио не существует, то по факту будет 1/3 на каждый тип текста)
         if r < 0.60:
             payload = random.choice(FRAGMENT_SNIPPETS)
         elif r < 0.80:
@@ -821,6 +935,11 @@ def _pick_random_times_for_date(date_local: datetime, n: int) -> list[datetime]:
 
 def schedule_packets_for_today(app: Application):
     conn = db()
+
+    frozen, _ = is_frozen(conn)
+    if frozen:
+        return  # заморозка: даже не планируем на сегодня
+
     now_local = datetime.now(TZ)
     key = _today_key(now_local)
     last = get_meta(conn, "last_scheduled_day")
